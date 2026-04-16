@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"github.com/gin-gonic/gin"
 	"github.com/gil/giltube/config"
+	"github.com/gil/giltube/internal/queue"
 )
 
 type Server struct {
 	router *gin.Engine
 	cfg    *config.Config
 	db     *sql.DB
+	queue  *queue.Queue
 }
 
 func NewServer(cfg *config.Config) *Server {
@@ -21,6 +23,7 @@ func NewServer(cfg *config.Config) *Server {
 	database := db.Connect(cfg.DatabaseURL)
 	s := &Server{cfg: cfg, db: database}
 	s.router = gin.Default()
+	s.queue = queue.New(cfg.RedisURL)
 	s.router.Static("/videos", filepath.Join(os.Getenv("HOME"), "giltube/output"))
 	s.setupRoutes()
 	return s

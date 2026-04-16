@@ -7,8 +7,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gil/giltube/internal/models"
-	"github.com/gil/giltube/internal/transcoder"
+	"github.com/gil/giltube/internal/queue"
+	"database/sql"
 )
+
 
 func (s *Server) uploadVideo(c *gin.Context) {
 	file, err := c.FormFile("video")
@@ -51,7 +53,12 @@ func (s *Server) uploadVideo(c *gin.Context) {
 	}
 
 
-	go transcoder.ProcessVideo(path, video.ID)
+	err= s.queue.Enqueue(queue.Job{VideoID: video.ID, FilePath: path})
+	if err != nil {
+		fmt.Println("Queue ERROR:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "queue failed"})
+		return
+	}
 
 	c.JSON(http.StatusCreated, video)
 }

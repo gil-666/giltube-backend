@@ -20,3 +20,12 @@ func Connect(databaseURL string) *sql.DB {
 	log.Println("Connected to database")
 	return db
 }
+
+func UpdateVideoStatus(db *sql.DB, videoID string, status string) error {
+	_, err := db.Exec(
+		"UPDATE videos SET status = $1 WHERE id = $2",
+		status,
+		videoID,
+	)
+	return err
+}
