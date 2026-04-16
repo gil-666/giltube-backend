@@ -34,17 +34,18 @@ func (s *Server) uploadVideo(c *gin.Context) {
 		Description:  c.PostForm("description"),
 		Status:    "uploaded",
 		CreatedAt: time.Now(),
-		ThumbnailURL: "/videos/" + videoID + "/thumbnail.jpg",
 		ChannelID: c.PostForm("channel_id"),
+
 	}
 	_, err = s.db.Exec(
-	"INSERT INTO videos (id, title, description, status, created_at, channel_id) VALUES ($1, $2, $3, $4, $5, $6)",
+	"INSERT INTO videos (id, title, description, status, created_at, channel_id, hls_path) VALUES ($1, $2, $3, $4, $5, $6, $7)",
 	video.ID,
 	video.Title,
 	video.Description,
 	video.Status,
 	video.CreatedAt,
 	video.ChannelID,
+	video.HLSPath,
 	)
 
 	
@@ -67,7 +68,7 @@ func (s *Server) uploadVideo(c *gin.Context) {
 
 func (s *Server) listVideos(c *gin.Context) {
 	rows, err := s.db.Query(
-		"SELECT id, title, description, status, channel_id, thumbnail_url, created_at FROM videos",
+		"SELECT id, title, description, status, channel_id, thumbnail_url, hls_path, created_at FROM videos",
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
@@ -86,6 +87,7 @@ func (s *Server) listVideos(c *gin.Context) {
 			&v.Status,
 			&v.ChannelID,
 			&v.ThumbnailURL,
+			&v.HLSPath,
 			&v.CreatedAt,
 		)
 		if err != nil {
@@ -130,4 +132,32 @@ func (s *Server) streamVideo(c *gin.Context) {
 
 	// 3. Serve file
 	c.File(fullPath)
+}
+
+func (s *Server) getVideo(c *gin.Context) {
+	id := c.Param("id")
+
+	var v models.Video
+
+	err := s.db.QueryRow(`
+		SELECT id, title, description, status, hls_path, thumbnail_url, created_at, channel_id
+		FROM videos
+		WHERE id=$1
+	`, id).Scan(
+		&v.ID,
+		&v.Title,
+		&v.Description,
+		&v.Status,
+		&v.HLSPath,
+		&v.ThumbnailURL,
+		&v.CreatedAt,
+		&v.ChannelID,
+	)
+
+	if err != nil {
+		c.JSON(404, gin.H{"error": "not found"})
+		return
+	}
+
+	c.JSON(200, v)
 }

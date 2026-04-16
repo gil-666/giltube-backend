@@ -17,6 +17,22 @@ type Server struct {
 	db     *sql.DB
 	queue  *queue.Queue
 }
+func CORSMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "*")
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(200)
+			return
+		}
+
+		c.Next()
+	}
+}
+
 
 func NewServer(cfg *config.Config) *Server {
 	// gin.SetMode(gin.ReleaseMode)
@@ -25,6 +41,7 @@ func NewServer(cfg *config.Config) *Server {
 	s.router = gin.Default()
 	s.queue = queue.New(cfg.RedisURL)
 	s.router.Static("/videos", filepath.Join(os.Getenv("HOME"), "giltube/output"))
+	s.router.Use(CORSMiddleware())
 	s.setupRoutes()
 	return s
 }
@@ -41,6 +58,7 @@ func (s *Server) setupRoutes() {
 		})
 
 		api.GET("/videos", s.listVideos)
+		api.GET("/videos/:id", s.getVideo)
 		api.GET("/videos/:id/stream/*filepath", s.streamVideo)
 		api.POST("/videos", s.uploadVideo)
 		api.POST("/users", s.createUser)

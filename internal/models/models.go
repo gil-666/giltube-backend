@@ -8,6 +8,7 @@ type Video struct {
 	Description  string    `json:"description"`
 	Status       string    `json:"status"`
 	CreatedAt    time.Time `json:"created_at"`
+	HLSPath	 string    `json:"hls_path"`
 	ThumbnailURL string    `json:"thumbnail_url"`
 	ChannelID string `json:"channel_id"`
 }
