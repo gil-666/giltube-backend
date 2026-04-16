@@ -17,7 +17,7 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config) *Server {
-	gin.SetMode(gin.ReleaseMode)
+	// gin.SetMode(gin.ReleaseMode)
 	database := db.Connect(cfg.DatabaseURL)
 	s := &Server{cfg: cfg, db: database}
 	s.router = gin.Default()
