@@ -61,9 +61,39 @@ func Transcode(inputPath, videoID string) error {
 		}
 	}
 
-	// fallback (very small videos)
+	// fallback for very small videos
 	if len(selected) == 0 {
-		selected = []Res{{"480p", height}}
+		selected = []Res{{"144p", height}}
+	}
+
+	// -------------------------
+	// Bitrate ladder (by name)
+	// -------------------------
+	bitrateMap := map[string]string{
+		"1080p": "5000k",
+		"720p":  "2500k",
+		"480p":  "1200k",
+		"360p":  "800k",
+		"240p":  "400k",
+		"144p":  "200k",
+	}
+
+	maxrateMap := map[string]string{
+		"1080p": "5350k",
+		"720p":  "2675k",
+		"480p":  "1280k",
+		"360p":  "856k",
+		"240p":  "428k",
+		"144p":  "214k",
+	}
+
+	bufsizeMap := map[string]string{
+		"1080p": "7500k",
+		"720p":  "3750k",
+		"480p":  "1800k",
+		"360p":  "1200k",
+		"240p":  "600k",
+		"144p":  "300k",
 	}
 
 	// -------------------------
@@ -76,7 +106,6 @@ func Transcode(inputPath, videoID string) error {
 	filter += ";"
 
 	for i, r := range selected {
-		// IMPORTANT: preserve aspect ratio, no padding
 		filter += fmt.Sprintf(
 			"[v%d]scale=-2:%d[v%dout];",
 			i, r.H, i,
@@ -99,10 +128,25 @@ func Transcode(inputPath, videoID string) error {
 		)
 	}
 
+	// per-stream encoding settings
+	for i, r := range selected {
+		args = append(args,
+			"-c:v:"+fmt.Sprint(i), "libx264",
+			"-preset", "veryfast",
+			"-crf", "20",
+
+			"-b:v:"+fmt.Sprint(i), bitrateMap[r.Name],
+			"-maxrate:v:"+fmt.Sprint(i), maxrateMap[r.Name],
+			"-bufsize:v:"+fmt.Sprint(i), bufsizeMap[r.Name],
+
+			// better HLS switching
+			"-g", "48",
+			"-keyint_min", "48",
+			"-sc_threshold", "0",
+		)
+	}
+
 	args = append(args,
-		"-c:v", "libx264",
-		"-preset", "veryfast",
-		"-crf", "23",
 		"-c:a", "aac",
 		"-b:a", "128k",
 
@@ -133,6 +177,7 @@ func Transcode(inputPath, videoID string) error {
 
 	return cmd.Run()
 }
+
 
 
 

@@ -4,11 +4,13 @@ import (
 	"net/http"
 	"time"
 	"fmt"
+	"strings"
+	"path/filepath"
+	"os"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gil/giltube/internal/models"
 	"github.com/gil/giltube/internal/queue"
-	"database/sql"
 )
 
 
@@ -93,4 +95,39 @@ func (s *Server) listVideos(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, videos)
+}
+
+func (s *Server) streamVideo(c *gin.Context) {
+	videoID := c.Param("id")
+	requestPath := c.Param("filepath") // includes /master.m3u8 or /0/segment.ts
+
+	// 1. Check video exists + status
+	var status string
+	err := s.db.QueryRow(
+		"SELECT status FROM videos WHERE id=$1",
+		videoID,
+	).Scan(&status)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "video not found"})
+		return
+	}
+
+	if status != "ready" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "video not ready"})
+		return
+	}
+
+	// 2. Build full path
+	baseDir := filepath.Join(os.Getenv("HOME"), "giltube/output", videoID)
+	fullPath := filepath.Join(baseDir, requestPath)
+
+	// 🔥 IMPORTANT: prevent path traversal attack
+	if !strings.HasPrefix(fullPath, baseDir) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+		return
+	}
+
+	// 3. Serve file
+	c.File(fullPath)
 }

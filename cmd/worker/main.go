@@ -68,6 +68,23 @@ func main() {
 		continue
 	}
 	
+	hlsPath := "/videos/" + job.VideoID + "/master.m3u8"
+	thumbURL := "/videos/" + job.VideoID + "/thumbnail.jpg"
+
+	_, err = database.Exec(
+		`UPDATE videos 
+		SET status=$1, hls_path=$2, thumbnail_url=$3 
+		WHERE id=$4`,
+		"ready",
+		hlsPath,
+		thumbURL,
+		job.VideoID,
+	)
+
+	if err != nil {
+		fmt.Println("DB update error:", err)
+	}
+
 	cleanup(job.FilePath)
 	fmt.Println("Done:", job.VideoID)
 	

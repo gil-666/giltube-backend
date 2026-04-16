@@ -41,7 +41,7 @@ func (s *Server) setupRoutes() {
 		})
 
 		api.GET("/videos", s.listVideos)
-
+		api.GET("/videos/:id/stream/*filepath", s.streamVideo)
 		api.POST("/videos", s.uploadVideo)
 		api.POST("/users", s.createUser)
 		api.POST("/channels", s.createChannel)
