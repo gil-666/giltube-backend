@@ -9,6 +9,6 @@ import (
 func main() {
 	cfg := config.Load()
 	server := api.NewServer(cfg)
-	log.Printf("GilTube API starting on :%s", cfg.Port)
-	server.Run(":" + cfg.Port)
+	log.Printf("GilTube API starting on 0.0.0.0:%s", cfg.Port)
+	server.Run("0.0.0.0:" + cfg.Port)
 }
