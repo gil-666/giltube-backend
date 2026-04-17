@@ -37,6 +37,8 @@ func (s *Server) uploadVideo(c *gin.Context) {
 		ChannelID: c.PostForm("channel_id"),
 
 	}
+	var channelID = strings.TrimSpace(c.PostForm("channel_id"))
+	fmt.Println("channel_id:", channelID)
 	_, err = s.db.Exec(
 	"INSERT INTO videos (id, title, description, status, created_at, channel_id, hls_path) VALUES ($1, $2, $3, $4, $5, $6, $7)",
 	video.ID,
@@ -44,7 +46,7 @@ func (s *Server) uploadVideo(c *gin.Context) {
 	video.Description,
 	video.Status,
 	video.CreatedAt,
-	video.ChannelID,
+	channelID,
 	video.HLSPath,
 	)
 
@@ -90,6 +92,8 @@ func (s *Server) listVideos(c *gin.Context) {
 			c.avatar_url
 		FROM videos v
 		JOIN channels c ON v.channel_id = c.id
+		WHERE v.status='ready'
+		ORDER BY v.created_at DESC
 	`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
@@ -198,7 +202,7 @@ func (s *Server) getVideo(c *gin.Context) {
 			c.created_at,
 			c.avatar_url
 		FROM videos v
-		JOIN channels c ON v.channel_id = c.id
+		LEFT JOIN channels c ON v.channel_id = c.id
 		WHERE v.id=$1
 	`, id).Scan(
 		&v.ID,

@@ -40,13 +40,20 @@ func main() {
 		fmt.Println("DB error:", err)
 		continue
 	}
-
+	thumbURL := "/videos/" + job.VideoID + "/thumbnail.jpg"
 	// 2. generate thumbnail
 	err = transcoder.GenerateThumbnail(job.FilePath, job.VideoID)
 	if err != nil {
 		fmt.Println("Thumbnail error:", err)
 
 		db.UpdateVideoStatus(database, job.VideoID, "failed")
+			_, err = database.Exec(
+		`UPDATE videos 
+		SET thumbnail_url=$1 
+		WHERE id=$2`,
+		thumbURL,
+		job.VideoID,
+	)
 		cleanup(job.FilePath)
 		continue
 	}
@@ -69,7 +76,7 @@ func main() {
 	}
 	
 	hlsPath := "/videos/" + job.VideoID + "/master.m3u8"
-	thumbURL := "/videos/" + job.VideoID + "/thumbnail.jpg"
+
 
 	_, err = database.Exec(
 		`UPDATE videos 
