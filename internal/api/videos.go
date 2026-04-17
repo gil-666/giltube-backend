@@ -69,9 +69,18 @@ func (s *Server) uploadVideo(c *gin.Context) {
 }
 
 func (s *Server) listVideos(c *gin.Context) {
+	type ChannelResponse struct {
+		ID          string `json:"id"`
+		UserID      string `json:"user_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		CreatedAt   time.Time `json:"created_at"`
+		AvatarURL   string `json:"avatar_url"`
+	}
+
 	type VideoResponse struct {
 		models.Video
-		Channel models.Channel `json:"channel"`
+		Channel ChannelResponse `json:"channel"`
 	}
 
 	rows, err := s.db.Query(`
@@ -102,6 +111,10 @@ func (s *Server) listVideos(c *gin.Context) {
 	defer rows.Close()
 
 	videos := []VideoResponse{}
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
 
 	for rows.Next() {
 		var v models.Video
@@ -128,9 +141,22 @@ func (s *Server) listVideos(c *gin.Context) {
 			continue
 		}
 
+		// Build avatar URL
+		avatarURL := ""
+		if ch.AvatarURL.Valid && ch.AvatarURL.String != "" {
+			avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, ch.AvatarURL.String)
+		}
+
 		videos = append(videos, VideoResponse{
-			Video:   v,
-			Channel: ch,
+			Video: v,
+			Channel: ChannelResponse{
+				ID:          ch.ID,
+				UserID:      ch.UserID,
+				Name:        ch.Name,
+				Description: ch.Description,
+				CreatedAt:   ch.CreatedAt,
+				AvatarURL:   avatarURL,
+			},
 		})
 	}
 
@@ -177,9 +203,18 @@ func (s *Server) streamVideo(c *gin.Context) {
 func (s *Server) getVideo(c *gin.Context) {
 	id := c.Param("id")
 
+	type ChannelResponse struct {
+		ID          string `json:"id"`
+		UserID      string `json:"user_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		CreatedAt   time.Time `json:"created_at"`
+		AvatarURL   string `json:"avatar_url"`
+	}
+
 	type VideoResponse struct {
 		models.Video
-		Channel models.Channel `json:"channel"`
+		Channel ChannelResponse `json:"channel"`
 	}
 
 	var v models.Video
@@ -227,10 +262,128 @@ func (s *Server) getVideo(c *gin.Context) {
 		return
 	}
 
+	// Build avatar URL
+	avatarURL := ""
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+	if ch.AvatarURL.Valid && ch.AvatarURL.String != "" {
+		avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, ch.AvatarURL.String)
+	}
+
 	c.JSON(http.StatusOK, VideoResponse{
-		Video:   v,
-		Channel: ch,
+		Video: v,
+		Channel: ChannelResponse{
+			ID:          ch.ID,
+			UserID:      ch.UserID,
+			Name:        ch.Name,
+			Description: ch.Description,
+			CreatedAt:   ch.CreatedAt,
+			AvatarURL:   avatarURL,
+		},
 	})
+}
+
+func (s *Server) getChannelVideos(c *gin.Context) {
+	channelID := c.Param("channel_id")
+
+	type ChannelResponse struct {
+		ID          string `json:"id"`
+		UserID      string `json:"user_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		CreatedAt   time.Time `json:"created_at"`
+		AvatarURL   string `json:"avatar_url"`
+	}
+
+	type VideoResponse struct {
+		models.Video
+		Channel ChannelResponse `json:"channel"`
+	}
+
+	rows, err := s.db.Query(`
+		SELECT 
+			v.id,
+			v.title,
+			v.description,
+			v.status,
+			v.hls_path,
+			v.thumbnail_url,
+			v.created_at,
+			v.channel_id,
+			c.id,
+			c.user_id,
+			c.name,
+			c.description,
+			c.created_at,
+			c.avatar_url
+		FROM videos v
+		JOIN channels c ON v.channel_id = c.id
+		WHERE v.channel_id=$1 AND v.status='ready'
+		ORDER BY v.created_at DESC
+	`, channelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
+		return
+	}
+	defer rows.Close()
+
+	videos := []VideoResponse{}
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+
+	for rows.Next() {
+		var v models.Video
+		var ch models.Channel
+
+		err := rows.Scan(
+			&v.ID,
+			&v.Title,
+			&v.Description,
+			&v.Status,
+			&v.HLSPath,
+			&v.ThumbnailURL,
+			&v.CreatedAt,
+			&v.ChannelID,
+
+			&ch.ID,
+			&ch.UserID,
+			&ch.Name,
+			&ch.Description,
+			&ch.CreatedAt,
+			&ch.AvatarURL,
+		)
+		if err != nil {
+			continue
+		}
+
+		// Build avatar URL
+		avatarURL := ""
+		if ch.AvatarURL.Valid && ch.AvatarURL.String != "" {
+			avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, ch.AvatarURL.String)
+		}
+
+		videos = append(videos, VideoResponse{
+			Video: v,
+			Channel: ChannelResponse{
+				ID:          ch.ID,
+				UserID:      ch.UserID,
+				Name:        ch.Name,
+				Description: ch.Description,
+				CreatedAt:   ch.CreatedAt,
+				AvatarURL:   avatarURL,
+			},
+		})
+	}
+
+	if videos == nil {
+		videos = []VideoResponse{}
+	}
+
+	c.JSON(http.StatusOK, videos)
 }
 
 

@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,7 +33,7 @@ func (s *Server) createUser(c *gin.Context) {
 	user := models.User{
 		ID:        uuid.New().String(),
 		Username:  body.Username,
-		Email:     body.Email,
+		Email:     strings.ToLower(body.Email),
 		Password:  string(hashedPassword),
 		CreatedAt: time.Now(),
 	}

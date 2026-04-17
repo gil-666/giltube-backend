@@ -20,7 +20,7 @@ type Server struct {
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "*")
 		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
 
@@ -41,6 +41,7 @@ func NewServer(cfg *config.Config) *Server {
 	s.router = gin.Default()
 	s.queue = queue.New(cfg.RedisURL)
 	s.router.Static("/videos", filepath.Join(os.Getenv("HOME"), "giltube/output"))
+	s.router.Static("/avatars", "data/avatars")
 	s.router.Use(CORSMiddleware())
 	s.setupRoutes()
 	return s
@@ -62,7 +63,12 @@ func (s *Server) setupRoutes() {
 		api.GET("/videos/:id/stream/*filepath", s.streamVideo)
 		api.POST("/videos", s.uploadVideo)
 		api.POST("/users", s.createUser)
+		api.GET("/users/:user_id/channels", s.listUserChannels)
 		api.POST("/channels", s.createChannel)
+		api.GET("/channels/:channel_id/info", s.getChannelInfo)
+		api.GET("/channels/:channel_id/videos", s.getChannelVideos)
+		api.PUT("/channels/:channel_id", s.updateChannel)
+		api.DELETE("/channels/:channel_id", s.deleteChannel)
 		api.POST("/login", s.login) 
 
 	}

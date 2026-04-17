@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -22,8 +23,8 @@ func (s *Server) login(c *gin.Context) {
 	var userID string
 
 	err := s.db.QueryRow(
-		"SELECT id, password FROM users WHERE email=$1",
-		body.Email,
+		"SELECT id, password FROM users WHERE LOWER(email)=$1",
+		strings.ToLower(body.Email),
 	).Scan(&userID, &hashedPassword)
 
 	if err != nil {
