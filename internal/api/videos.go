@@ -67,37 +67,73 @@ func (s *Server) uploadVideo(c *gin.Context) {
 }
 
 func (s *Server) listVideos(c *gin.Context) {
-	rows, err := s.db.Query(
-		"SELECT id, title, description, status, channel_id, thumbnail_url, hls_path, created_at FROM videos",
-	)
+	type VideoResponse struct {
+		models.Video
+		Channel models.Channel `json:"channel"`
+	}
+
+	rows, err := s.db.Query(`
+		SELECT 
+			v.id,
+			v.title,
+			v.description,
+			v.status,
+			v.hls_path,
+			v.thumbnail_url,
+			v.created_at,
+			v.channel_id,
+			c.id,
+			c.user_id,
+			c.name,
+			c.description,
+			c.created_at,
+			c.avatar_url
+		FROM videos v
+		JOIN channels c ON v.channel_id = c.id
+	`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
 		return
 	}
 	defer rows.Close()
 
-	videos := []models.Video{}
+	videos := []VideoResponse{}
 
 	for rows.Next() {
 		var v models.Video
+		var ch models.Channel
+
 		err := rows.Scan(
 			&v.ID,
 			&v.Title,
 			&v.Description,
 			&v.Status,
-			&v.ChannelID,
-			&v.ThumbnailURL,
 			&v.HLSPath,
+			&v.ThumbnailURL,
 			&v.CreatedAt,
+			&v.ChannelID,
+
+			&ch.ID,
+			&ch.UserID,
+			&ch.Name,
+			&ch.Description,
+			&ch.CreatedAt,
+			&ch.AvatarURL,
 		)
 		if err != nil {
 			continue
 		}
-		videos = append(videos, v)
+
+		videos = append(videos, VideoResponse{
+			Video:   v,
+			Channel: ch,
+		})
 	}
 
 	c.JSON(http.StatusOK, videos)
 }
+
+
 
 func (s *Server) streamVideo(c *gin.Context) {
 	videoID := c.Param("id")
@@ -137,12 +173,33 @@ func (s *Server) streamVideo(c *gin.Context) {
 func (s *Server) getVideo(c *gin.Context) {
 	id := c.Param("id")
 
+	type VideoResponse struct {
+		models.Video
+		Channel models.Channel `json:"channel"`
+	}
+
 	var v models.Video
+	var ch models.Channel
 
 	err := s.db.QueryRow(`
-		SELECT id, title, description, status, hls_path, thumbnail_url, created_at, channel_id
-		FROM videos
-		WHERE id=$1
+		SELECT 
+			v.id,
+			v.title,
+			v.description,
+			v.status,
+			v.hls_path,
+			v.thumbnail_url,
+			v.created_at,
+			v.channel_id,
+			c.id,
+			c.user_id,
+			c.name,
+			c.description,
+			c.created_at,
+			c.avatar_url
+		FROM videos v
+		JOIN channels c ON v.channel_id = c.id
+		WHERE v.id=$1
 	`, id).Scan(
 		&v.ID,
 		&v.Title,
@@ -152,12 +209,25 @@ func (s *Server) getVideo(c *gin.Context) {
 		&v.ThumbnailURL,
 		&v.CreatedAt,
 		&v.ChannelID,
+
+		&ch.ID,
+		&ch.UserID,
+		&ch.Name,
+		&ch.Description,
+		&ch.CreatedAt,
+		&ch.AvatarURL,
 	)
 
 	if err != nil {
-		c.JSON(404, gin.H{"error": "not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 
-	c.JSON(200, v)
+	c.JSON(http.StatusOK, VideoResponse{
+		Video:   v,
+		Channel: ch,
+	})
 }
+
+
+
