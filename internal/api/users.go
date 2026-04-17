@@ -35,7 +35,7 @@ func (s *Server) createUser(c *gin.Context) {
 		Username:  body.Username,
 		Email:     strings.ToLower(body.Email),
 		Password:  string(hashedPassword),
-		CreatedAt: time.Now(),
+		CreatedAt: time.Now().UTC(),
 	}
 
 	_, err = s.db.Exec(

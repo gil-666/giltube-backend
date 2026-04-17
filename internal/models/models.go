@@ -10,6 +10,8 @@ type Video struct {
 	Title        string    `json:"title"`
 	Description  string    `json:"description"`
 	Status       string    `json:"status"`
+	Progress     int       `json:"progress"`
+	Views        int       `json:"views"`
 	CreatedAt    time.Time `json:"created_at"`
 	HLSPath	 string    `json:"hls_path"`
 	ThumbnailURL string    `json:"thumbnail_url"`

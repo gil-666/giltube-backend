@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 func GetVideoResolution(inputPath string) (int, int, error) {
@@ -28,6 +30,73 @@ func GetVideoResolution(inputPath string) (int, int, error) {
 	return w, h, nil
 }
 
+func GetVideoFrameRate(inputPath string) (float64, error) {
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=r_frame_rate",
+		"-of", "csv=s=x:p=0",
+		inputPath,
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return 30, nil // default to 30fps on error
+	}
+
+	// r_frame_rate comes as "num/den" (e.g., "60/1", "30000/1001")
+	fpsStr := strings.TrimSpace(string(out))
+	parts := strings.Split(fpsStr, "/")
+
+	if len(parts) != 2 {
+		return 30, nil // default to 30fps
+	}
+
+	num, err1 := strconv.ParseFloat(parts[0], 64)
+	den, err2 := strconv.ParseFloat(parts[1], 64)
+
+	if err1 != nil || err2 != nil || den == 0 {
+		return 30, nil // default to 30fps
+	}
+
+	fps := num / den
+	fmt.Printf("Detected frame rate: %.2f fps\n", fps)
+
+	return fps, nil
+}
+
+// ApplyFrameRateMultiplier returns a bitrate multiplier based on frame rate
+func ApplyFrameRateMultiplier(fps float64) float64 {
+	if fps > 60 {
+		return 2.0 // Very high frame rate (e.g., 120fps) -> 2x bitrate
+	} else if fps >= 48 {
+		return 1.5 // High frame rate (e.g., 60fps) -> 1.5x bitrate
+	}
+	return 1.0 // Standard frame rate (24-30fps) -> no change
+}
+
+// ApplyMultiplierToBitrate parses a bitrate string and applies the multiplier
+func ApplyMultiplierToBitrate(bitrateStr string, multiplier float64) string {
+	if multiplier == 1.0 {
+		return bitrateStr
+	}
+
+	// Parse bitrate (e.g., "5000k" -> 5000)
+	bitrateStr = strings.TrimSpace(bitrateStr)
+	var value float64
+	var unit string
+
+	fmt.Sscanf(bitrateStr, "%f%s", &value, &unit)
+
+	if unit == "" {
+		unit = "k"
+	}
+
+	newValue := int(value * multiplier)
+	return fmt.Sprintf("%d%s", newValue, unit)
+}
+
 
 func Transcode(inputPath, videoID string) error {
 	outputDir := filepath.Join(os.Getenv("HOME"), "giltube/output", videoID)
@@ -37,7 +106,11 @@ func Transcode(inputPath, videoID string) error {
 		return err
 	}
 
+	fps, _ := GetVideoFrameRate(inputPath)
+	multiplier := ApplyFrameRateMultiplier(fps)
+
 	fmt.Println("Source resolution:", width, "x", height)
+	fmt.Printf("Frame rate multiplier: %.2fx\n", multiplier)
 
 	type Res struct {
 		Name string
@@ -135,9 +208,9 @@ func Transcode(inputPath, videoID string) error {
 			"-preset", "veryfast",
 			"-crf", "20",
 
-			"-b:v:"+fmt.Sprint(i), bitrateMap[r.Name],
-			"-maxrate:v:"+fmt.Sprint(i), maxrateMap[r.Name],
-			"-bufsize:v:"+fmt.Sprint(i), bufsizeMap[r.Name],
+			"-b:v:"+fmt.Sprint(i), ApplyMultiplierToBitrate(bitrateMap[r.Name], multiplier),
+			"-maxrate:v:"+fmt.Sprint(i), ApplyMultiplierToBitrate(maxrateMap[r.Name], multiplier),
+			"-bufsize:v:"+fmt.Sprint(i), ApplyMultiplierToBitrate(bufsizeMap[r.Name], multiplier),
 
 			// better HLS switching
 			"-g", "48",

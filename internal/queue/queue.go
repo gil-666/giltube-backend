@@ -17,6 +17,11 @@ type Job struct {
 	FilePath string `json:"file_path"`
 }
 
+type DownloadJob struct {
+	VideoID string `json:"video_id"`
+	Quality string `json:"quality"`
+}
+
 func New(redisURL string) *Queue {
 	opt, _ := redis.ParseURL(redisURL)
 	client := redis.NewClient(opt)
@@ -29,6 +34,11 @@ func (q *Queue) Enqueue(job Job) error {
 	return q.client.RPush(ctx, "video_jobs", data).Err()
 }
 
+func (q *Queue) EnqueueDownload(job DownloadJob) error {
+	data, _ := json.Marshal(job)
+	return q.client.RPush(ctx, "download_jobs", data).Err()
+}
+
 func (q *Queue) Dequeue() (*Job, error) {
 	result, err := q.client.BLPop(ctx, 0, "video_jobs").Result()
 	if err != nil {
@@ -36,6 +46,18 @@ func (q *Queue) Dequeue() (*Job, error) {
 	}
 
 	var job Job
+	json.Unmarshal([]byte(result[1]), &job)
+
+	return &job, nil
+}
+
+func (q *Queue) DequeueDownload() (*DownloadJob, error) {
+	result, err := q.client.BLPop(ctx, 0, "download_jobs").Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var job DownloadJob
 	json.Unmarshal([]byte(result[1]), &job)
 
 	return &job, nil

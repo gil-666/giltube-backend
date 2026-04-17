@@ -29,7 +29,7 @@ func saveChannelAvatar(c *gin.Context, channelID string) (string, error) {
 
 	// Generate filename using channel ID and timestamp
 	ext := filepath.Ext(file.Filename)
-	filename := fmt.Sprintf("%s_%d%s", channelID, time.Now().Unix(), ext)
+	filename := fmt.Sprintf("%s_%d%s", channelID, time.Now().UTC().Unix(), ext)
 	filepath := filepath.Join(avatarDir, filename)
 
 	// Save file to disk
@@ -78,7 +78,7 @@ func (s *Server) createChannel(c *gin.Context) {
 		UserID:      userID,
 		Name:        name,
 		Description: description,
-		CreatedAt:   time.Now(),
+		CreatedAt:   time.Now().UTC(),
 	}
 
 	// Try to save avatar if provided

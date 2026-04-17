@@ -29,3 +29,20 @@ func UpdateVideoStatus(db *sql.DB, videoID string, status string) error {
 	)
 	return err
 }
+
+func UpdateVideoProgress(db *sql.DB, videoID string, progress int) error {
+	_, err := db.Exec(
+		"UPDATE videos SET progress = $1 WHERE id = $2",
+		progress,
+		videoID,
+	)
+	return err
+}
+
+func IncrementVideoViews(db *sql.DB, videoID string) error {
+	_, err := db.Exec(
+		"UPDATE videos SET views = views + 1 WHERE id = $1",
+		videoID,
+	)
+	return err
+}
