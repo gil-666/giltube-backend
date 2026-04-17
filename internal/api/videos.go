@@ -387,6 +387,7 @@ func (s *Server) getVideo(c *gin.Context) {
 			v.description,
 			v.status,
 			COALESCE(v.views, 0),
+			COALESCE((SELECT COUNT(*) FROM likes WHERE video_id = v.id), 0),
 			v.hls_path,
 			v.thumbnail_url,
 			v.created_at,
@@ -406,6 +407,7 @@ func (s *Server) getVideo(c *gin.Context) {
 		&v.Description,
 		&v.Status,
 		&v.Views,
+		&v.Likes,
 		&v.HLSPath,
 		&v.ThumbnailURL,
 		&v.CreatedAt,
@@ -445,6 +447,89 @@ func (s *Server) getVideo(c *gin.Context) {
 			AvatarURL:   avatarURL,
 		},
 	})
+}
+
+func (s *Server) likeVideo(c *gin.Context) {
+	videoID := c.Param("id")
+	channelID := c.Query("channel_id")
+	
+	if channelID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id is required"})
+		return
+	}
+
+	// Check if already liked
+	liked, err := db.CheckIfLiked(s.db, videoID, channelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check failed"})
+		return
+	}
+	if liked {
+		c.JSON(http.StatusConflict, gin.H{"error": "already liked"})
+		return
+	}
+
+	// Create like
+	likeID := uuid.New().String()
+	err = db.CreateLike(s.db, likeID, videoID, channelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "like failed"})
+		return
+	}
+
+	// Get updated likes count
+	likesCount, _ := db.GetLikesCount(s.db, videoID)
+	c.JSON(http.StatusOK, gin.H{"likes": likesCount, "liked": true})
+}
+
+func (s *Server) unlikeVideo(c *gin.Context) {
+	videoID := c.Param("id")
+	channelID := c.Query("channel_id")
+	
+	if channelID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id is required"})
+		return
+	}
+
+	// Check if liked
+	liked, err := db.CheckIfLiked(s.db, videoID, channelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check failed"})
+		return
+	}
+	if !liked {
+		c.JSON(http.StatusConflict, gin.H{"error": "not liked"})
+		return
+	}
+
+	// Delete like
+	err = db.DeleteLike(s.db, videoID, channelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unlike failed"})
+		return
+	}
+
+	// Get updated likes count
+	likesCount, _ := db.GetLikesCount(s.db, videoID)
+	c.JSON(http.StatusOK, gin.H{"likes": likesCount, "liked": false})
+}
+
+func (s *Server) checkIfLiked(c *gin.Context) {
+	videoID := c.Param("id")
+	channelID := c.Query("channel_id")
+	
+	if channelID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id is required"})
+		return
+	}
+
+	liked, err := db.CheckIfLiked(s.db, videoID, channelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"liked": liked})
 }
 
 func (s *Server) getChannelVideos(c *gin.Context) {
