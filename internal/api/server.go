@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 	"github.com/gil/giltube/internal/db"
 	"database/sql"
 	"os"
@@ -40,6 +41,10 @@ func NewServer(cfg *config.Config) *Server {
 	s := &Server{cfg: cfg, db: database}
 	s.router = gin.Default()
 	s.queue = queue.New(cfg.RedisURL)
+	
+	// Allow large file uploads - buffer up to 1GB before spilling to disk
+	s.router.MaxMultipartMemory = 1 << 30 // 1GB
+	
 	s.router.Static("/videos", filepath.Join(os.Getenv("HOME"), "giltube/output"))
 	s.router.Static("/downloads", filepath.Join(os.Getenv("HOME"), "giltube/downloads"))
 	s.router.Static("/avatars", "data/avatars")
@@ -49,7 +54,15 @@ func NewServer(cfg *config.Config) *Server {
 }
 
 func (s *Server) Run(addr string) error {
-	return s.router.Run(addr)
+	srv := &http.Server{
+		Addr:           addr,
+		Handler:        s.router,
+		ReadTimeout:    1 * time.Hour,     // 1 hour for reading entire request (large uploads)
+		WriteTimeout:   1 * time.Hour,     // 1 hour for writing response
+		IdleTimeout:    5 * time.Minute,   // 5 minutes for idle connections
+		MaxHeaderBytes: 1 << 20,           // 1MB max header size
+	}
+	return srv.ListenAndServe()
 }
 
 func (s *Server) setupRoutes() {
@@ -73,6 +86,8 @@ func (s *Server) setupRoutes() {
 		api.GET("/videos/:id/download", s.downloadVideo)
 		api.GET("/videos/:id/download-status", s.getDownloadStatus)
 		api.GET("/downloads/:videoID/:quality", s.serveDownload)
+		api.POST("/videos/upload-chunk", s.uploadChunk)
+		api.POST("/videos/finalize-upload", s.finalizeUpload)
 		api.POST("/videos", s.uploadVideo)
 		api.DELETE("/videos/:id", s.deleteVideo)
 		api.POST("/users", s.createUser)

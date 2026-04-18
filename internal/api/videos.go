@@ -1,6 +1,7 @@
 package api
 
 import (
+	"io"
 	"net/http"
 	"time"
 	"fmt"
@@ -814,5 +815,207 @@ func (s *Server) incrementViews(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "views incremented"})
+}
+
+func (s *Server) uploadChunk(c *gin.Context) {
+	// Get the chunk file
+	file, err := c.FormFile("chunk")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no chunk file provided"})
+		return
+	}
+
+	// Get or create upload ID - accept both camelCase and snake_case
+	uploadID := c.PostForm("uploadSessionId")
+	if uploadID == "" {
+		uploadID = c.PostForm("upload_id")
+	}
+	if uploadID == "" {
+		uploadID = c.Query("uploadSessionId")
+	}
+	if uploadID == "" {
+		uploadID = c.Query("upload_id")
+	}
+	// Generate new upload ID if not provided
+	if uploadID == "" {
+		uploadID = uuid.New().String()
+	}
+
+	// Get chunk index - accept both camelCase and snake_case
+	chunkIndex := c.PostForm("chunkIndex")
+	if chunkIndex == "" {
+		chunkIndex = c.PostForm("chunk_index")
+	}
+	if chunkIndex == "" {
+		chunkIndex = c.Query("chunkIndex")
+	}
+	if chunkIndex == "" {
+		chunkIndex = c.Query("chunk_index")
+	}
+	if chunkIndex == "" {
+		chunkIndex = "0"
+	}
+
+	// Create upload directory if it doesn't exist
+	uploadsDir := filepath.Join("/tmp", "giltube-uploads", uploadID)
+	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create upload directory"})
+		return
+	}
+
+	// Save chunk with index as filename
+	chunkPath := filepath.Join(uploadsDir, fmt.Sprintf("chunk_%s", chunkIndex))
+	if err := c.SaveUploadedFile(file, chunkPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save chunk"})
+		return
+	}
+
+	fmt.Printf("Saved chunk %s for upload %s (size: %d bytes)\n", chunkIndex, uploadID, file.Size)
+
+	// Return the upload_id so frontend can use it for subsequent requests
+	c.JSON(http.StatusOK, gin.H{
+		"upload_id": uploadID,
+		"chunk_index": chunkIndex,
+		"message": "chunk uploaded successfully",
+	})
+}
+
+func (s *Server) finalizeUpload(c *gin.Context) {
+	// Accept both camelCase and snake_case parameter names
+	uploadID := c.PostForm("uploadSessionId")
+	if uploadID == "" {
+		uploadID = c.PostForm("upload_id")
+	}
+	if uploadID == "" {
+		uploadID = c.Query("uploadSessionId")
+	}
+	if uploadID == "" {
+		uploadID = c.Query("upload_id")
+	}
+	if uploadID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "upload_id/uploadSessionId is required"})
+		return
+	}
+
+	title := c.PostForm("title")
+	if title == "" {
+		title = c.Query("title")
+	}
+	if title == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "title is required"})
+		return
+	}
+
+	description := c.PostForm("description")
+	if description == "" {
+		description = c.Query("description")
+	}
+
+	// Accept both camelCase and snake_case for channel_id
+	channelID := c.PostForm("channel_id")
+	if channelID == "" {
+		channelID = c.PostForm("channelId")
+	}
+	if channelID == "" {
+		channelID = c.Query("channel_id")
+	}
+	if channelID == "" {
+		channelID = c.Query("channelId")
+	}
+	if channelID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id/channelId is required"})
+		return
+	}
+
+	// Get all chunks from upload directory
+	uploadsDir := filepath.Join("/tmp", "giltube-uploads", uploadID)
+	
+	// List all chunks in the directory
+	entries, err := os.ReadDir(uploadsDir)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "upload not found or expired"})
+		return
+	}
+
+	if len(entries) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no chunks found for this upload"})
+		return
+	}
+
+	// Create final video file
+	videoID := uuid.New().String()
+	finalPath := filepath.Join("/tmp", fmt.Sprintf("%s.mp4", videoID))
+
+	// Combine chunks into final file
+	finalFile, err := os.Create(finalPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create final file"})
+		return
+	}
+	defer finalFile.Close()
+
+	// Write each chunk to the final file
+	for i := 0; i < len(entries); i++ {
+		chunkPath := filepath.Join(uploadsDir, fmt.Sprintf("chunk_%d", i))
+		chunkFile, err := os.Open(chunkPath)
+		if err != nil {
+			// Chunks don't need to be sequential, just combine all chunk_* files
+			continue
+		}
+
+		if _, err := io.Copy(finalFile, chunkFile); err != nil {
+			chunkFile.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to combine chunks"})
+			return
+		}
+		chunkFile.Close()
+	}
+
+	// Create video record in database
+	video := models.Video{
+		ID:          videoID,
+		Title:       title,
+		Description: description,
+		Status:      "uploaded",
+		CreatedAt:   time.Now().UTC(),
+		ChannelID:   channelID,
+	}
+
+	_, err = s.db.Exec(
+		"INSERT INTO videos (id, title, description, status, created_at, channel_id, hls_path) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+		video.ID,
+		video.Title,
+		video.Description,
+		video.Status,
+		video.CreatedAt,
+		channelID,
+		video.HLSPath,
+	)
+
+	if err != nil {
+		fmt.Println("DB ERROR:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save video record"})
+		return
+	}
+
+	// Queue video for processing
+	err = s.queue.Enqueue(queue.Job{VideoID: video.ID, FilePath: finalPath})
+	if err != nil {
+		fmt.Println("Queue ERROR:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue video for processing"})
+		return
+	}
+
+	// Clean up upload directory
+	os.RemoveAll(uploadsDir)
+
+	fmt.Printf("Finalized upload %s as video %s (title: %s)\n", uploadID, videoID, title)
+
+	c.JSON(http.StatusCreated, gin.H{
+		"video_id": video.ID,
+		"title": video.Title,
+		"status": video.Status,
+		"created_at": video.CreatedAt,
+	})
 }
 
