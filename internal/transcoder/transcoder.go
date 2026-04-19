@@ -254,8 +254,7 @@ func Transcode(inputPath, videoID string) error {
 
 
 
-func GenerateThumbnail(inputPath, videoID string) error {
-	outputDir := filepath.Join(os.Getenv("HOME"), "giltube/output", videoID)
+func GenerateThumbnail(inputPath, videoID, outputDir string) error {
 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return err
@@ -269,6 +268,7 @@ func GenerateThumbnail(inputPath, videoID string) error {
 		"-i", inputPath,
 		"-vframes", "1",
 		"-q:v", "2",
+		"-update", "1",
 		thumbPath,
 	)
 
@@ -290,7 +290,7 @@ func ProcessVideo(inputPath, videoID string) {
 	}
 
 	// Generate thumbnail
-	err = GenerateThumbnail(inputPath, videoID)
+	err = GenerateThumbnail(inputPath, videoID, outputDir)
 	if err != nil {
 		fmt.Println("Thumbnail error:", err)
 	} else {

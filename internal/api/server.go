@@ -47,7 +47,7 @@ func NewServer(cfg *config.Config) *Server {
 	
 	s.router.Static("/videos", filepath.Join(os.Getenv("HOME"), "giltube/output"))
 	s.router.Static("/downloads", filepath.Join(os.Getenv("HOME"), "giltube/downloads"))
-	s.router.Static("/avatars", "data/avatars")
+	s.router.Static("/avatars", filepath.Join(os.Getenv("HOME"), "giltube/giltube-backend/data/avatars"))
 	s.router.Use(CORSMiddleware())
 	s.setupRoutes()
 	return s
@@ -89,6 +89,7 @@ func (s *Server) setupRoutes() {
 		api.POST("/videos/upload-chunk", s.uploadChunk)
 		api.POST("/videos/finalize-upload", s.finalizeUpload)
 		api.POST("/videos", s.uploadVideo)
+		api.PUT("/videos/:id", s.updateVideo)
 		api.DELETE("/videos/:id", s.deleteVideo)
 		api.POST("/users", s.createUser)
 		api.GET("/users/:user_id/channels", s.listUserChannels)

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,7 +17,7 @@ import (
 // saveChannelAvatar saves an uploaded avatar file and returns the relative path
 func saveChannelAvatar(c *gin.Context, channelID string) (string, error) {
 	// Create avatars directory if it doesn't exist
-	avatarDir := filepath.Join("data", "avatars")
+	avatarDir := filepath.Join(os.Getenv("HOME"), "giltube", "giltube-backend", "data", "avatars")
 	if err := os.MkdirAll(avatarDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create avatar directory: %w", err)
 	}
@@ -46,11 +47,14 @@ func channelResponse(c *gin.Context, ch models.Channel) gin.H {
 	avatarURL := ""
 	if ch.AvatarURL.Valid {
 		filename := ch.AvatarURL.String
-		scheme := "http"
-		if c.Request.TLS != nil {
-			scheme = "https"
+		// Handle both old format (full path) and new format (just filename)
+		if !strings.HasPrefix(filename, "/avatars/") {
+			// Just filename - prepend /avatars/
+			avatarURL = fmt.Sprintf("/avatars/%s", filename)
+		} else {
+			// Already has /avatars/ - use as is
+			avatarURL = filename
 		}
-		avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, filename)
 	}
 	
 	return gin.H{

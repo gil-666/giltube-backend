@@ -16,6 +16,7 @@ type Video struct {
 	CreatedAt    time.Time `json:"created_at"`
 	HLSPath	 string    `json:"hls_path"`
 	ThumbnailURL string    `json:"thumbnail_url"`
+	HasCustomThumbnail bool `json:"has_custom_thumbnail"`
 	ChannelID string `json:"channel_id"`
 }
 

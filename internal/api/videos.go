@@ -2,12 +2,14 @@ package api
 
 import (
 	"io"
+	"bytes"
 	"net/http"
 	"time"
 	"fmt"
 	"strings"
 	"path/filepath"
 	"os"
+	"mime/multipart"
 	"database/sql"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -24,7 +26,7 @@ func (s *Server) uploadVideo(c *gin.Context) {
 		return
 	}
 
-	path := "/tmp/" + file.Filename
+	path := filepath.Join(os.TempDir(), file.Filename)
 
 	if err := c.SaveUploadedFile(file, path); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "save failed"})
@@ -96,6 +98,7 @@ func (s *Server) listVideos(c *gin.Context) {
 			COALESCE(v.views, 0),
 			v.hls_path,
 			v.thumbnail_url,
+			COALESCE(v.has_custom_thumbnail, false),
 			v.created_at,
 			v.channel_id,
 			c.id,
@@ -116,10 +119,6 @@ func (s *Server) listVideos(c *gin.Context) {
 	defer rows.Close()
 
 	videos := []VideoResponse{}
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
-	}
 
 	for rows.Next() {
 		var v models.Video
@@ -135,6 +134,7 @@ func (s *Server) listVideos(c *gin.Context) {
 			&v.Views,
 			&v.HLSPath,
 			&v.ThumbnailURL,
+			&v.HasCustomThumbnail,
 			&v.CreatedAt,
 			&v.ChannelID,
 
@@ -153,7 +153,7 @@ func (s *Server) listVideos(c *gin.Context) {
 		// Build avatar URL
 		avatarURL := ""
 		if chAvatarURL.Valid && chAvatarURL.String != "" {
-			avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, chAvatarURL.String)
+			avatarURL = fmt.Sprintf("/avatars/%s", chAvatarURL.String)
 		}
 
 		videos = append(videos, VideoResponse{
@@ -235,6 +235,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 			COALESCE(v.views, 0),
 			v.hls_path,
 			v.thumbnail_url,
+			COALESCE(v.has_custom_thumbnail, false),
 			v.created_at,
 			v.channel_id,
 			c.id,
@@ -255,10 +256,6 @@ func (s *Server) listMyVideos(c *gin.Context) {
 	defer rows.Close()
 
 	videos := []VideoResponse{}
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
-	}
 
 	for rows.Next() {
 		var v models.Video
@@ -276,6 +273,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 			&v.Views,
 			&v.HLSPath,
 			&thumbnailURL,
+			&v.HasCustomThumbnail,
 			&v.CreatedAt,
 			&v.ChannelID,
 
@@ -301,7 +299,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 		// Build avatar URL
 		avatarURL := ""
 		if chAvatarURL.Valid && chAvatarURL.String != "" {
-			avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, chAvatarURL.String)
+			avatarURL = fmt.Sprintf("/avatars/%s", chAvatarURL.String)
 		}
 
 		videos = append(videos, VideoResponse{
@@ -392,6 +390,7 @@ func (s *Server) getVideo(c *gin.Context) {
 			COALESCE((SELECT COUNT(*) FROM likes WHERE video_id = v.id), 0),
 			COALESCE(v.hls_path, ''),
 			COALESCE(v.thumbnail_url, ''),
+			COALESCE(v.has_custom_thumbnail, false) as has_custom_thumbnail,
 			v.created_at,
 			v.channel_id,
 			c.id,
@@ -413,6 +412,7 @@ func (s *Server) getVideo(c *gin.Context) {
 		&v.Likes,
 		&v.HLSPath,
 		&v.ThumbnailURL,
+		&v.HasCustomThumbnail,
 		&v.CreatedAt,
 		&v.ChannelID,
 
@@ -431,12 +431,8 @@ func (s *Server) getVideo(c *gin.Context) {
 
 	// Build avatar URL
 	avatarURL := ""
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
-	}
 	if ch.AvatarURL.Valid && ch.AvatarURL.String != "" {
-		avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, ch.AvatarURL.String)
+		avatarURL = fmt.Sprintf("/avatars/%s", ch.AvatarURL.String)
 	}
 
 	c.JSON(http.StatusOK, VideoResponse{
@@ -561,6 +557,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 			COALESCE(v.views, 0),
 			v.hls_path,
 			v.thumbnail_url,
+			COALESCE(v.has_custom_thumbnail, false),
 			v.created_at,
 			v.channel_id,
 			c.id,
@@ -581,10 +578,6 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 	defer rows.Close()
 
 	videos := []VideoResponse{}
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
-	}
 
 	for rows.Next() {
 		var v models.Video
@@ -600,6 +593,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 			&v.Views,
 			&v.HLSPath,
 			&v.ThumbnailURL,
+			&v.HasCustomThumbnail,
 			&v.CreatedAt,
 			&v.ChannelID,
 
@@ -617,7 +611,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 		// Build avatar URL
 		avatarURL := ""
 		if chAvatarURL.Valid && chAvatarURL.String != "" {
-			avatarURL = fmt.Sprintf("%s://%s/avatars/%s", scheme, c.Request.Host, chAvatarURL.String)
+			avatarURL = fmt.Sprintf("/avatars/%s", chAvatarURL.String)
 		}
 
 		videos = append(videos, VideoResponse{
@@ -1017,5 +1011,160 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 		"status": video.Status,
 		"created_at": video.CreatedAt,
 	})
+}
+
+func (s *Server) updateVideo(c *gin.Context) {
+	videoID := c.Param("id")
+	userID := c.GetHeader("X-User-ID")
+	
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	// Get video to verify ownership and current state
+	var video models.Video
+	var channelID string
+	err := s.db.QueryRow(
+		"SELECT id, channel_id FROM videos WHERE id = $1",
+		videoID,
+	).Scan(&video.ID, &channelID)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "video not found"})
+		return
+	}
+
+	// Verify user owns this video via channel ownership
+	var channelUserID string
+	err = s.db.QueryRow(
+		"SELECT user_id FROM channels WHERE id = $1",
+		channelID,
+	).Scan(&channelUserID)
+
+	if err != nil || channelUserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+		return
+	}
+
+	// Get form data - handle both JSON and form-data
+	var req struct {
+		Title                  string `json:"title" form:"title"`
+		Description            string `json:"description" form:"description"`
+		RevertToAutoThumbnail  bool   `json:"revert_to_auto_thumbnail" form:"revert_to_auto_thumbnail"`
+	}
+	
+	// Try parsing as JSON first, then fall back to form
+	contentType := c.ContentType()
+	fmt.Printf("DEBUG: contentType=%q\n", contentType)
+	
+	// Read body for debugging
+	bodyBytes, _ := io.ReadAll(c.Request.Body)
+	fmt.Printf("DEBUG: body=%s\n", string(bodyBytes))
+	
+	// Reset body for actual parsing
+	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	
+	if strings.Contains(contentType, "application/json") {
+		if err := c.BindJSON(&req); err != nil {
+			fmt.Printf("DEBUG JSON parse error: %v\n", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
+			return
+		}
+	} else {
+		// Parse as form data
+		req.Title = c.PostForm("title")
+		req.Description = c.PostForm("description")
+		req.RevertToAutoThumbnail = c.PostForm("revert_to_auto_thumbnail") == "true"
+	}
+
+	// Get thumbnail file if uploaded (only available with form data)
+	var thumbnailFile *multipart.FileHeader
+	if !strings.Contains(contentType, "application/json") {
+		thumbnailFile, _ = c.FormFile("thumbnail")
+	}
+	
+	fmt.Printf("DEBUG updateVideo: title=%q, hasFile=%v, revert=%v\n", req.Title, thumbnailFile != nil, req.RevertToAutoThumbnail)
+	
+	// Build update data
+	updateFields := []string{}
+	updateArgs := []interface{}{}
+	argCount := 1
+
+	if req.Title != "" {
+		updateFields = append(updateFields, fmt.Sprintf("title = $%d", argCount))
+		updateArgs = append(updateArgs, req.Title)
+		argCount++
+	}
+
+	if req.Description != "" {
+		updateFields = append(updateFields, fmt.Sprintf("description = $%d", argCount))
+		updateArgs = append(updateArgs, req.Description)
+		argCount++
+	}
+
+	// Handle thumbnail upload
+	if err == nil && thumbnailFile != nil {
+		// Save custom thumbnail
+		homeDir := os.Getenv("HOME")
+		thumbnailsDir := filepath.Join(homeDir, "giltube/output", videoID)
+		if err := os.MkdirAll(thumbnailsDir, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create thumbnail directory"})
+			return
+		}
+
+		// Save with unique name
+		thumbnailName := fmt.Sprintf("custom_thumbnail_%d.jpg", time.Now().Unix())
+		thumbnailPath := filepath.Join(thumbnailsDir, thumbnailName)
+		
+		if err := c.SaveUploadedFile(thumbnailFile, thumbnailPath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save thumbnail"})
+			return
+		}
+
+		// Update database with thumbnail path
+		thumbnailURL := fmt.Sprintf("/videos/%s/%s", videoID, thumbnailName)
+		updateFields = append(updateFields, fmt.Sprintf("thumbnail_url = $%d", argCount))
+		updateArgs = append(updateArgs, thumbnailURL)
+		argCount++
+
+		// Always mark as custom thumbnail when uploading a new one
+		updateFields = append(updateFields, fmt.Sprintf("has_custom_thumbnail = $%d", argCount))
+		updateArgs = append(updateArgs, true)
+		argCount++
+	} else if req.RevertToAutoThumbnail {
+		// Clear custom thumbnail and revert to auto-generated
+		autoThumbnailURL := fmt.Sprintf("/videos/%s/thumbnail.jpg", videoID)
+		updateFields = append(updateFields, fmt.Sprintf("thumbnail_url = $%d", argCount))
+		updateArgs = append(updateArgs, autoThumbnailURL)
+		argCount++
+		
+		updateFields = append(updateFields, fmt.Sprintf("has_custom_thumbnail = $%d", argCount))
+		updateArgs = append(updateArgs, false)
+		argCount++
+	}
+
+	if len(updateFields) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
+		return
+	}
+
+	// Add video ID as last parameter
+	updateArgs = append(updateArgs, videoID)
+	
+	// Build and execute update query
+	query := fmt.Sprintf("UPDATE videos SET %s WHERE id = $%d", 
+		strings.Join(updateFields, ", "), argCount)
+	
+	fmt.Printf("DEBUG updateVideo: query=%s, args=%v\n", query, updateArgs)
+	
+	_, err = s.db.Exec(query, updateArgs...)
+	if err != nil {
+		fmt.Println("Update error:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update video"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "video updated successfully"})
 }
 
