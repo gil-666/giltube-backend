@@ -7,6 +7,7 @@ import (
 	"time"
 	"fmt"
 	"strings"
+	"strconv"
 	"path/filepath"
 	"os"
 	"mime/multipart"
@@ -17,6 +18,18 @@ import (
 	"github.com/gil/giltube/internal/queue"
 	"github.com/gil/giltube/internal/db"
 )
+
+// Helper function to safely parse integer query parameters
+func parseInt(value string, defaultVal int) int {
+	if value == "" {
+		return defaultVal
+	}
+	num, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultVal
+	}
+	return num
+}
 
 
 func (s *Server) uploadVideo(c *gin.Context) {
@@ -62,6 +75,25 @@ func (s *Server) uploadVideo(c *gin.Context) {
 	return
 	}
 
+	// Handle category assignments if provided
+	categoryIDsStr := c.PostForm("category_ids")
+	if categoryIDsStr != "" {
+		// Parse comma-separated category IDs
+		categoryIDs := strings.Split(categoryIDsStr, ",")
+		var validCategoryIDs []string
+		for _, id := range categoryIDs {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				validCategoryIDs = append(validCategoryIDs, trimmed)
+			}
+		}
+		
+		if len(validCategoryIDs) > 0 {
+			if err := db.AssignCategoriesToVideo(s.db, video.ID, validCategoryIDs); err != nil {
+				fmt.Println("Category assignment error:", err)
+				// Continue anyway, don't fail the upload
+			}
+		}
+	}
 
 	err= s.queue.Enqueue(queue.Job{VideoID: video.ID, FilePath: path})
 	if err != nil {
@@ -81,6 +113,7 @@ func (s *Server) listVideos(c *gin.Context) {
 		Description string `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
 		AvatarURL   string `json:"avatar_url"`
+		Verified    bool `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -88,7 +121,24 @@ func (s *Server) listVideos(c *gin.Context) {
 		Channel ChannelResponse `json:"channel"`
 	}
 
-	// Public endpoint - return all published videos ordered by recent
+	// Get pagination parameters
+	limit := 12
+	offset := 0
+	if l := c.DefaultQuery("limit", ""); l != "" {
+		if parsed := parseInt(l, 12); parsed > 0 {
+			limit = parsed
+			if limit > 100 {
+				limit = 100 // Cap at 100 to prevent abuse
+			}
+		}
+	}
+	if o := c.DefaultQuery("offset", ""); o != "" {
+		if parsed := parseInt(o, 0); parsed >= 0 {
+			offset = parsed
+		}
+	}
+
+	// Public endpoint - return all published videos ordered by recent with pagination
 	rows, err := s.db.Query(`
 		SELECT 
 			v.id,
@@ -97,8 +147,10 @@ func (s *Server) listVideos(c *gin.Context) {
 			v.status,
 			COALESCE(v.views, 0),
 			v.hls_path,
-			v.thumbnail_url,
+			COALESCE(v.thumbnail_url, ''),
 			COALESCE(v.has_custom_thumbnail, false),
+			COALESCE(v.explicit, false),
+			COALESCE(v.width, 0),
 			v.created_at,
 			v.channel_id,
 			c.id,
@@ -106,12 +158,14 @@ func (s *Server) listVideos(c *gin.Context) {
 			c.name,
 			c.description,
 			c.created_at,
-			c.avatar_url
+			c.avatar_url,
+			COALESCE(c.verified, false)
 		FROM videos v
 		LEFT JOIN channels c ON v.channel_id = c.id
 		WHERE v.status = 'ready'
 		ORDER BY v.created_at DESC
-	`)
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
 		return
@@ -125,6 +179,7 @@ func (s *Server) listVideos(c *gin.Context) {
 		var chID, chUserID, chName, chDesc sql.NullString
 		var chCreatedAt sql.NullTime
 		var chAvatarURL sql.NullString
+		var chVerified sql.NullBool
 
 		err := rows.Scan(
 			&v.ID,
@@ -135,6 +190,8 @@ func (s *Server) listVideos(c *gin.Context) {
 			&v.HLSPath,
 			&v.ThumbnailURL,
 			&v.HasCustomThumbnail,
+			&v.Explicit,
+			&v.Width,
 			&v.CreatedAt,
 			&v.ChannelID,
 
@@ -144,6 +201,7 @@ func (s *Server) listVideos(c *gin.Context) {
 			&chDesc,
 			&chCreatedAt,
 			&chAvatarURL,
+			&chVerified,
 		)
 		if err != nil {
 			fmt.Println("Scan error:", err)
@@ -156,6 +214,19 @@ func (s *Server) listVideos(c *gin.Context) {
 			avatarURL = fmt.Sprintf("/avatars/%s", chAvatarURL.String)
 		}
 
+		// Fetch categories for this video
+		categories, err := db.GetVideoCategories(s.db, v.ID)
+		if err == nil && categories != nil {
+			for _, cat := range categories {
+				v.Categories = append(v.Categories, models.Category{
+					ID:          cat["id"].(string),
+					Name:        cat["name"].(string),
+					Slug:        cat["slug"].(string),
+					Description: cat["description"].(string),
+				})
+			}
+		}
+
 		videos = append(videos, VideoResponse{
 			Video: v,
 			Channel: ChannelResponse{
@@ -165,6 +236,7 @@ func (s *Server) listVideos(c *gin.Context) {
 				Description: chDesc.String,
 				CreatedAt:   chCreatedAt.Time,
 				AvatarURL:   avatarURL,
+				Verified:    chVerified.Bool,
 			},
 		})
 	}
@@ -216,6 +288,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 		Description string `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
 		AvatarURL   string `json:"avatar_url"`
+		Verified    bool `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -233,17 +306,21 @@ func (s *Server) listMyVideos(c *gin.Context) {
 			v.status,
 			COALESCE(v.progress, 0),
 			COALESCE(v.views, 0),
+			COALESCE((SELECT COUNT(*) FROM likes WHERE video_id = v.id), 0),
 			v.hls_path,
 			v.thumbnail_url,
 			COALESCE(v.has_custom_thumbnail, false),
-			v.created_at,
-			v.channel_id,
-			c.id,
-			c.user_id,
-			c.name,
-			c.description,
-			c.created_at,
-			c.avatar_url
+		COALESCE(v.explicit, false),
+		COALESCE(v.width, 0),
+		v.created_at,
+		v.channel_id,
+		c.id,
+		c.user_id,
+		c.name,
+		c.description,
+		c.created_at,
+		c.avatar_url,
+		COALESCE(c.verified, false)
 		FROM videos v
 		LEFT JOIN channels c ON v.channel_id = c.id
 		WHERE v.channel_id = $1
@@ -263,6 +340,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 		var chCreatedAt sql.NullTime
 		var chAvatarURL sql.NullString
 		var thumbnailURL sql.NullString
+		var chVerified sql.NullBool
 
 		err := rows.Scan(
 			&v.ID,
@@ -271,9 +349,12 @@ func (s *Server) listMyVideos(c *gin.Context) {
 			&v.Status,
 			&v.Progress,
 			&v.Views,
+			&v.Likes,
 			&v.HLSPath,
 			&thumbnailURL,
 			&v.HasCustomThumbnail,
+			&v.Explicit,
+			&v.Width,
 			&v.CreatedAt,
 			&v.ChannelID,
 
@@ -283,6 +364,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 			&chDesc,
 			&chCreatedAt,
 			&chAvatarURL,
+			&chVerified,
 		)
 		if err != nil {
 			fmt.Println("Scan error:", err)
@@ -311,6 +393,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 				Description: chDesc.String,
 				CreatedAt:   chCreatedAt.Time,
 				AvatarURL:   avatarURL,
+				Verified:    chVerified.Bool,
 			},
 		})
 	}
@@ -369,6 +452,7 @@ func (s *Server) getVideo(c *gin.Context) {
 		Description string `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
 		AvatarURL   string `json:"avatar_url"`
+		Verified    bool `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -391,14 +475,17 @@ func (s *Server) getVideo(c *gin.Context) {
 			COALESCE(v.hls_path, ''),
 			COALESCE(v.thumbnail_url, ''),
 			COALESCE(v.has_custom_thumbnail, false) as has_custom_thumbnail,
-			v.created_at,
-			v.channel_id,
-			c.id,
-			c.user_id,
-			c.name,
-			c.description,
-			c.created_at,
-			c.avatar_url
+		COALESCE(v.explicit, false),
+		COALESCE(v.width, 0),
+		v.created_at,
+		v.channel_id,
+		c.id,
+		c.user_id,
+		c.name,
+		c.description,
+		c.created_at,
+		c.avatar_url,
+		COALESCE(c.verified, false)
 		FROM videos v
 		LEFT JOIN channels c ON v.channel_id = c.id
 		WHERE v.id=$1
@@ -413,6 +500,8 @@ func (s *Server) getVideo(c *gin.Context) {
 		&v.HLSPath,
 		&v.ThumbnailURL,
 		&v.HasCustomThumbnail,
+		&v.Explicit,
+		&v.Width,
 		&v.CreatedAt,
 		&v.ChannelID,
 
@@ -422,6 +511,7 @@ func (s *Server) getVideo(c *gin.Context) {
 		&ch.Description,
 		&ch.CreatedAt,
 		&ch.AvatarURL,
+		&ch.Verified,
 	)
 
 	if err != nil {
@@ -435,6 +525,23 @@ func (s *Server) getVideo(c *gin.Context) {
 		avatarURL = fmt.Sprintf("/avatars/%s", ch.AvatarURL.String)
 	}
 
+	fmt.Printf("DEBUG getVideo response: id=%s, explicit=%v\n", v.ID, v.Explicit)
+	
+	// Fetch categories for this video
+	categories, err := db.GetVideoCategories(s.db, v.ID)
+	if err == nil && categories != nil {
+		// Convert map slice to Category slice
+		for _, cat := range categories {
+			v.Categories = append(v.Categories, models.Category{
+				ID:          cat["id"].(string),
+				Name:        cat["name"].(string),
+				Slug:        cat["slug"].(string),
+				Description: cat["description"].(string),
+				CreatedAt:   time.Now(), // This is fetched separately
+			})
+		}
+	}
+	
 	c.JSON(http.StatusOK, VideoResponse{
 		Video: v,
 		Channel: ChannelResponse{
@@ -444,6 +551,7 @@ func (s *Server) getVideo(c *gin.Context) {
 			Description: ch.Description,
 			CreatedAt:   ch.CreatedAt,
 			AvatarURL:   avatarURL,
+			Verified:    ch.Verified,
 		},
 	})
 }
@@ -541,6 +649,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 		Description string `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
 		AvatarURL   string `json:"avatar_url"`
+		Verified    bool `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -558,14 +667,17 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 			v.hls_path,
 			v.thumbnail_url,
 			COALESCE(v.has_custom_thumbnail, false),
-			v.created_at,
-			v.channel_id,
-			c.id,
-			c.user_id,
-			c.name,
-			c.description,
-			c.created_at,
-			c.avatar_url
+		COALESCE(v.explicit, false),
+		COALESCE(v.width, 0),
+		v.created_at,
+		v.channel_id,
+		c.id,
+		c.user_id,
+		c.name,
+		c.description,
+		c.created_at,
+		c.avatar_url,
+		COALESCE(c.verified, false)
 		FROM videos v
 		JOIN channels c ON v.channel_id = c.id
 		WHERE v.channel_id=$1 AND v.status='ready'
@@ -584,6 +696,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 		var chID, chUserID, chName, chDesc sql.NullString
 		var chCreatedAt sql.NullTime
 		var chAvatarURL sql.NullString
+		var chVerified sql.NullBool
 
 		err := rows.Scan(
 			&v.ID,
@@ -594,6 +707,8 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 			&v.HLSPath,
 			&v.ThumbnailURL,
 			&v.HasCustomThumbnail,
+			&v.Explicit,
+			&v.Width,
 			&v.CreatedAt,
 			&v.ChannelID,
 
@@ -603,6 +718,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 			&chDesc,
 			&chCreatedAt,
 			&chAvatarURL,
+			&chVerified,
 		)
 		if err != nil {
 			continue
@@ -623,6 +739,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 				Description: chDesc.String,
 				CreatedAt:   chCreatedAt.Time,
 				AvatarURL:   avatarURL,
+				Verified:    chVerified.Bool,
 			},
 		})
 	}
@@ -811,6 +928,19 @@ func (s *Server) incrementViews(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "views incremented"})
 }
 
+func (s *Server) getChannelAnalytics(c *gin.Context) {
+	channelID := c.Param("channel_id")
+
+	// Public endpoint - no authentication required
+	analytics, err := db.GetChannelAnalytics(s.db, channelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch analytics"})
+		return
+	}
+
+	c.JSON(http.StatusOK, analytics)
+}
+
 func (s *Server) uploadChunk(c *gin.Context) {
 	// Get the chunk file
 	file, err := c.FormFile("chunk")
@@ -905,6 +1035,10 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 		description = c.Query("description")
 	}
 
+	// Get explicit flag
+	explicitStr := c.PostForm("explicit")
+	explicit := explicitStr == "true"
+
 	// Accept both camelCase and snake_case for channel_id
 	channelID := c.PostForm("channel_id")
 	if channelID == "" {
@@ -973,10 +1107,33 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 		Status:      "uploaded",
 		CreatedAt:   time.Now().UTC(),
 		ChannelID:   channelID,
+		Explicit:    explicit,
+	}
+
+	// Handle thumbnail upload if provided
+	var thumbnailURL string
+	var hasCustomThumbnail bool
+	
+	thumbnailFile, err := c.FormFile("thumbnail")
+	if err == nil && thumbnailFile != nil {
+		// Save custom thumbnail using same path as edit-video
+		homeDir := os.Getenv("HOME")
+		thumbnailsDir := filepath.Join(homeDir, "giltube/output", videoID)
+		if err := os.MkdirAll(thumbnailsDir, 0755); err == nil {
+			// Save with timestamped name
+			thumbnailName := fmt.Sprintf("custom_thumbnail_%d.jpg", time.Now().Unix())
+			thumbnailPath := filepath.Join(thumbnailsDir, thumbnailName)
+			
+			if err := c.SaveUploadedFile(thumbnailFile, thumbnailPath); err == nil {
+				// Set thumbnail URL and mark as custom
+				thumbnailURL = fmt.Sprintf("/videos/%s/%s", videoID, thumbnailName)
+				hasCustomThumbnail = true
+			}
+		}
 	}
 
 	_, err = s.db.Exec(
-		"INSERT INTO videos (id, title, description, status, created_at, channel_id, hls_path) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+		"INSERT INTO videos (id, title, description, status, created_at, channel_id, hls_path, explicit, thumbnail_url, has_custom_thumbnail) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
 		video.ID,
 		video.Title,
 		video.Description,
@@ -984,6 +1141,9 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 		video.CreatedAt,
 		channelID,
 		video.HLSPath,
+		explicit,
+		thumbnailURL,
+		hasCustomThumbnail,
 	)
 
 	if err != nil {
@@ -1052,6 +1212,8 @@ func (s *Server) updateVideo(c *gin.Context) {
 		Title                  string `json:"title" form:"title"`
 		Description            string `json:"description" form:"description"`
 		RevertToAutoThumbnail  bool   `json:"revert_to_auto_thumbnail" form:"revert_to_auto_thumbnail"`
+		Explicit               *bool  `json:"explicit" form:"explicit"`
+		CategoryIDs            string `json:"category_ids" form:"category_ids"`
 	}
 	
 	// Try parsing as JSON first, then fall back to form
@@ -1076,6 +1238,14 @@ func (s *Server) updateVideo(c *gin.Context) {
 		req.Title = c.PostForm("title")
 		req.Description = c.PostForm("description")
 		req.RevertToAutoThumbnail = c.PostForm("revert_to_auto_thumbnail") == "true"
+		req.CategoryIDs = c.PostForm("category_ids")
+		
+		// Parse explicit as boolean from form
+		explicitStr := c.PostForm("explicit")
+		if explicitStr != "" {
+			explicitBool := explicitStr == "true"
+			req.Explicit = &explicitBool
+		}
 	}
 
 	// Get thumbnail file if uploaded (only available with form data)
@@ -1084,7 +1254,7 @@ func (s *Server) updateVideo(c *gin.Context) {
 		thumbnailFile, _ = c.FormFile("thumbnail")
 	}
 	
-	fmt.Printf("DEBUG updateVideo: title=%q, hasFile=%v, revert=%v\n", req.Title, thumbnailFile != nil, req.RevertToAutoThumbnail)
+	fmt.Printf("DEBUG updateVideo: title=%q, hasFile=%v, revert=%v, explicit=%v\n", req.Title, thumbnailFile != nil, req.RevertToAutoThumbnail, req.Explicit)
 	
 	// Build update data
 	updateFields := []string{}
@@ -1100,6 +1270,13 @@ func (s *Server) updateVideo(c *gin.Context) {
 	if req.Description != "" {
 		updateFields = append(updateFields, fmt.Sprintf("description = $%d", argCount))
 		updateArgs = append(updateArgs, req.Description)
+		argCount++
+	}
+
+	// Handle explicit flag (18+ content warning)
+	if req.Explicit != nil {
+		updateFields = append(updateFields, fmt.Sprintf("explicit = $%d", argCount))
+		updateArgs = append(updateArgs, *req.Explicit)
 		argCount++
 	}
 
@@ -1163,6 +1340,24 @@ func (s *Server) updateVideo(c *gin.Context) {
 		fmt.Println("Update error:", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update video"})
 		return
+	}
+
+	// Handle category updates if provided
+	if req.CategoryIDs != "" {
+		categoryIDs := strings.Split(req.CategoryIDs, ",")
+		var validCategoryIDs []string
+		for _, id := range categoryIDs {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				validCategoryIDs = append(validCategoryIDs, trimmed)
+			}
+		}
+		
+		if len(validCategoryIDs) > 0 {
+			if err := db.AssignCategoriesToVideo(s.db, videoID, validCategoryIDs); err != nil {
+				fmt.Println("Category assignment error:", err)
+				// Continue anyway, don't fail the update
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "video updated successfully"})

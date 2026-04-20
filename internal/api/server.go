@@ -72,6 +72,14 @@ func (s *Server) setupRoutes() {
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		})
 
+		// Search 
+		api.GET("/search", s.search)
+
+		// Categories
+		api.GET("/categories", s.listCategories)
+		api.GET("/categories/all", s.listAllCategories)
+		api.GET("/categories/:slug/videos", s.getVideosByCategory)
+
 		api.GET("/videos", s.listVideos)
 		api.GET("/my-videos", s.listMyVideos)
 		api.GET("/videos/:id", s.getVideo)
@@ -80,6 +88,7 @@ func (s *Server) setupRoutes() {
 		api.DELETE("/videos/:id/like", s.unlikeVideo)
 		api.GET("/videos/:id/liked", s.checkIfLiked)
 		api.GET("/videos/:id/comments", s.getVideoComments)
+		api.GET("/channels/:channel_id/analytics", s.getChannelAnalytics)
 		api.POST("/videos/:id/comments", s.createComment)
 		api.DELETE("/comments/:comment_id", s.deleteComment)
 		api.GET("/videos/:id/stream/*filepath", s.streamVideo)

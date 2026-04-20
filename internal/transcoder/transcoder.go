@@ -97,6 +97,73 @@ func ApplyMultiplierToBitrate(bitrateStr string, multiplier float64) string {
 	return fmt.Sprintf("%d%s", newValue, unit)
 }
 
+// GetVideoBitDepth returns the bit depth of the video (8, 10, 12, etc.)
+func GetVideoBitDepth(inputPath string) int {
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=pix_fmt",
+		"-of", "csv=p=0",
+		inputPath,
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return 8 // default to 8-bit
+	}
+
+	pixFmt := strings.TrimSpace(string(out))
+	
+	// Check for 10-bit formats
+	if strings.Contains(pixFmt, "10le") || strings.Contains(pixFmt, "10be") ||
+		strings.Contains(pixFmt, "p10") || strings.Contains(pixFmt, "10") {
+		fmt.Printf("Detected 10-bit video: %s\n", pixFmt)
+		return 10
+	}
+	
+	// Check for 12-bit formats
+	if strings.Contains(pixFmt, "12le") || strings.Contains(pixFmt, "12be") {
+		fmt.Printf("Detected 12-bit video: %s\n", pixFmt)
+		return 12
+	}
+	
+	fmt.Printf("Detected 8-bit video: %s\n", pixFmt)
+	return 8
+}
+
+// IsHDRVideo checks if the video uses HDR transfer characteristics (smpte2084, arib-std-b67, etc.)
+func IsHDRVideo(inputPath string) bool {
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=color_transfer",
+		"-of", "csv=p=0",
+		inputPath,
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	transfer := strings.TrimSpace(string(out))
+	
+	// Check for HDR transfer functions
+	isHDR := strings.Contains(transfer, "smpte2084") || // PQ (Dolby Vision)
+		strings.Contains(transfer, "arib-std-b67") ||    // HLG
+		strings.Contains(transfer, "bt2020-10") ||       // BT.2020 10-bit
+		transfer == "16"                                  // smpte2084 numeric code
+	
+	if isHDR {
+		fmt.Printf("Detected HDR video (transfer: %s)\n", transfer)
+	}
+	
+	return isHDR
+}
+
+
 
 func Transcode(inputPath, videoID string) error {
 	outputDir := filepath.Join(os.Getenv("HOME"), "giltube/output", videoID)
@@ -264,11 +331,13 @@ func GenerateThumbnail(inputPath, videoID, outputDir string) error {
 
 	cmd := exec.Command(
 		"ffmpeg",
-		"-ss", "3",
+		"-ss", "3",           // Seek to 3 seconds
+		"-thread_queue_size", "8",   // Reduce thread queue size to avoid excessive buffering
 		"-i", inputPath,
-		"-vframes", "1",
-		"-q:v", "2",
-		"-update", "1",
+		"-vframes", "1",      // Extract exactly 1 frame
+		"-pix_fmt", "yuvj420p", // Use full-range YUV for JPEG compatibility
+		"-q:v", "2",          // Quality 2 (high quality)
+		"-update", "1",       // Update output file
 		thumbPath,
 	)
 

@@ -55,7 +55,8 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 			c.created_at,
 			ch.id,
 			ch.name,
-			COALESCE(ch.avatar_url, '')
+			COALESCE(ch.avatar_url, ''),
+			COALESCE(ch.verified, false)
 		FROM comments c
 		JOIN channels ch ON c.channel_id = ch.id
 		WHERE c.video_id = $1
@@ -69,7 +70,8 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 	var comments []map[string]interface{}
 	for rows.Next() {
 		var id, text, createdAt, chID, chName, chAvatarURL string
-		err := rows.Scan(&id, &text, &createdAt, &chID, &chName, &chAvatarURL)
+		var chVerified bool
+		err := rows.Scan(&id, &text, &createdAt, &chID, &chName, &chAvatarURL, &chVerified)
 		if err != nil {
 			continue
 		}
@@ -81,6 +83,7 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 				"id":         chID,
 				"name":       chName,
 				"avatar_url": chAvatarURL,
+				"verified":   chVerified,
 			},
 		})
 	}
@@ -150,3 +153,147 @@ func GetLikesCount(db *sql.DB, videoID string) (int, error) {
 	return count, nil
 }
 
+// GetChannelAnalytics returns aggregate views and likes data for all videos in a channel
+func GetChannelAnalytics(db *sql.DB, channelID string) (map[string]interface{}, error) {
+	// Get total views and likes
+	var totalViews int
+	var totalLikes int
+
+	err := db.QueryRow(`
+		SELECT 
+			COALESCE(SUM(views), 0),
+			(SELECT COUNT(*) FROM likes l JOIN videos v ON l.video_id = v.id WHERE v.channel_id = $1)
+		FROM videos
+		WHERE channel_id = $1
+	`, channelID).Scan(&totalViews, &totalLikes)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"channel_id": channelID,
+		"total_views": totalViews,
+		"total_likes": totalLikes,
+	}, nil
+}
+
+// GetVideoCategories retrieves all categories for a video
+func GetVideoCategories(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
+	rows, err := db.Query(`
+		SELECT c.id, c.name, c.slug, c.description, c.created_at
+		FROM categories c
+		JOIN video_categories vc ON c.id = vc.category_id
+		WHERE vc.video_id = $1
+		ORDER BY c.name
+	`, videoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var categories []map[string]interface{}
+	for rows.Next() {
+		var id, name, slug, description string
+		var createdAt string
+		if err := rows.Scan(&id, &name, &slug, &description, &createdAt); err != nil {
+			continue
+		}
+		categories = append(categories, map[string]interface{}{
+			"id":          id,
+			"name":        name,
+			"slug":        slug,
+			"description": description,
+			"created_at":  createdAt,
+		})
+	}
+	return categories, nil
+}
+
+// GetAllCategories retrieves all available categories (for dropdowns/uploads)
+func GetAllCategories(db *sql.DB) ([]map[string]interface{}, error) {
+	rows, err := db.Query(`
+		SELECT id, name, slug, description, created_at
+		FROM categories
+		ORDER BY name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var categories []map[string]interface{}
+	for rows.Next() {
+		var id, name, slug, description string
+		var createdAt string
+		if err := rows.Scan(&id, &name, &slug, &description, &createdAt); err != nil {
+			continue
+		}
+		categories = append(categories, map[string]interface{}{
+			"id":          id,
+			"name":        name,
+			"slug":        slug,
+			"description": description,
+			"created_at":  createdAt,
+		})
+	}
+	return categories, nil
+}
+
+// GetCategoriesWithVideos retrieves only categories that have videos (for sidebar filtering)
+func GetCategoriesWithVideos(db *sql.DB) ([]map[string]interface{}, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT c.id, c.name, c.slug, c.description, c.created_at, COUNT(v.id) as video_count
+		FROM categories c
+		LEFT JOIN video_categories vc ON c.id = vc.category_id
+		LEFT JOIN videos v ON vc.video_id = v.id AND v.status = 'ready'
+		GROUP BY c.id, c.name, c.slug, c.description, c.created_at
+		HAVING COUNT(v.id) > 0
+		ORDER BY c.name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var categories []map[string]interface{}
+	for rows.Next() {
+		var id, name, slug, description string
+		var createdAt string
+		var videoCount int
+		if err := rows.Scan(&id, &name, &slug, &description, &createdAt, &videoCount); err != nil {
+			continue
+		}
+		categories = append(categories, map[string]interface{}{
+			"id":          id,
+			"name":        name,
+			"slug":        slug,
+			"description": description,
+			"created_at":  createdAt,
+			"video_count": videoCount,
+		})
+	}
+	return categories, nil
+}
+
+// AssignCategoriesToVideo assigns categories to a video
+func AssignCategoriesToVideo(db *sql.DB, videoID string, categoryIDs []string) error {
+	// First, delete existing categories for this video
+	_, err := db.Exec("DELETE FROM video_categories WHERE video_id = $1", videoID)
+	if err != nil {
+		return err
+	}
+
+	// Insert new categories
+	for _, categoryID := range categoryIDs {
+		_, err := db.Exec(
+			"INSERT INTO video_categories (id, video_id, category_id, created_at) VALUES (gen_random_uuid()::text, $1, $2, NOW())",
+			videoID,
+			categoryID,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -64,6 +64,7 @@ func channelResponse(c *gin.Context, ch models.Channel) gin.H {
 		"description": ch.Description,
 		"created_at":  ch.CreatedAt,
 		"avatar_url":  avatarURL,
+		"verified":    ch.Verified,
 	}
 }
 
@@ -114,7 +115,7 @@ func (s *Server) listUserChannels(c *gin.Context) {
 	userID := c.Param("user_id")
 
 	rows, err := s.db.Query(
-		"SELECT id, user_id, name, description, created_at, avatar_url FROM channels WHERE user_id=$1 ORDER BY created_at DESC",
+		"SELECT id, user_id, name, description, created_at, avatar_url, verified FROM channels WHERE user_id=$1 ORDER BY created_at DESC",
 		userID,
 	)
 	if err != nil {
@@ -126,7 +127,7 @@ func (s *Server) listUserChannels(c *gin.Context) {
 	var channels []models.Channel
 	for rows.Next() {
 		var channel models.Channel
-		if err := rows.Scan(&channel.ID, &channel.UserID, &channel.Name, &channel.Description, &channel.CreatedAt, &channel.AvatarURL); err != nil {
+		if err := rows.Scan(&channel.ID, &channel.UserID, &channel.Name, &channel.Description, &channel.CreatedAt, &channel.AvatarURL, &channel.Verified); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan failed"})
 			return
 		}
@@ -185,9 +186,9 @@ func (s *Server) updateChannel(c *gin.Context) {
 	// Fetch and return the updated channel
 	var channel models.Channel
 	err = s.db.QueryRow(
-		"SELECT id, user_id, name, description, created_at, avatar_url FROM channels WHERE id=$1",
+		"SELECT id, user_id, name, description, created_at, avatar_url, verified FROM channels WHERE id=$1",
 		channelID,
-	).Scan(&channel.ID, &channel.UserID, &channel.Name, &channel.Description, &channel.CreatedAt, &channel.AvatarURL)
+	).Scan(&channel.ID, &channel.UserID, &channel.Name, &channel.Description, &channel.CreatedAt, &channel.AvatarURL, &channel.Verified)
 	
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch updated channel"})
@@ -218,9 +219,9 @@ func (s *Server) getChannelInfo(c *gin.Context) {
 
 	// Get channel with owner username
 	err := s.db.QueryRow(
-		"SELECT c.id, c.user_id, c.name, c.description, c.created_at, c.avatar_url, u.username FROM channels c JOIN users u ON c.user_id = u.id WHERE c.id=$1",
+		"SELECT c.id, c.user_id, c.name, c.description, c.created_at, c.avatar_url, c.verified, u.username FROM channels c JOIN users u ON c.user_id = u.id WHERE c.id=$1",
 		channelID,
-	).Scan(&channel.ID, &channel.UserID, &channel.Name, &channel.Description, &channel.CreatedAt, &channel.AvatarURL, &username)
+	).Scan(&channel.ID, &channel.UserID, &channel.Name, &channel.Description, &channel.CreatedAt, &channel.AvatarURL, &channel.Verified, &username)
 
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})

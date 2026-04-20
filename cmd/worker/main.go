@@ -59,6 +59,33 @@ func translatePath(inputPath string) string {
 	return inputPath
 }
 
+// convertWindowsPathToWSL converts Windows UNC paths to native WSL Linux paths
+// This is needed when the worker runs inside WSL but receives Windows paths
+func convertWindowsPathToWSL(inputPath string) string {
+	if runtime.GOOS != "linux" {
+		return inputPath
+	}
+	
+	// Handle Windows UNC paths: \\wsl.localhost\Ubuntu\path\to\file
+	if strings.HasPrefix(inputPath, "\\\\wsl.localhost\\Ubuntu\\") {
+		// Remove the prefix and convert backslashes to forward slashes
+		linuxPath := strings.TrimPrefix(inputPath, "\\\\wsl.localhost\\Ubuntu")
+		linuxPath = strings.ReplaceAll(linuxPath, "\\", "/")
+		if !strings.HasPrefix(linuxPath, "/") {
+			linuxPath = "/" + linuxPath
+		}
+		return linuxPath
+	}
+	
+	// Handle plain Windows paths like C:\path\to\file (unlikely but handle it)
+	if strings.Contains(inputPath, "\\") && len(inputPath) > 1 && inputPath[1] == ':' {
+		// This is a Windows absolute path, just convert separators (shouldn't happen in WSL)
+		return strings.ReplaceAll(inputPath, "\\", "/")
+	}
+	
+	return inputPath
+}
+
 func getTotalFrames(inputPath string) (int, error) {
 	cmd := exec.Command(
 		"ffprobe",
@@ -228,14 +255,14 @@ func cleanup(path string) {
 	}
 }
 
-func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, selected []Resolution, totalFrames int, multiplier float64, outputDir string) error {
+func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, selected []Resolution, totalFrames int, multiplier float64, outputDir string, hasCaptions bool, bitDepth int, isHDR bool) error {
 	// Encode only the highest quality variant (first in selected array)
 	if len(selected) == 0 {
 		return fmt.Errorf("no resolutions selected")
 	}
 
 	highestQuality := selected[0]
-	fmt.Printf("Encoding highest quality first: %s\n", highestQuality.Name)
+	fmt.Printf("Encoding highest quality first: %s (bit depth: %d)\n", highestQuality.Name, bitDepth)
 	
 	// Check if video has audio
 	videoHasAudio := hasAudio(inputPath)
@@ -271,9 +298,26 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 		"144p":  "300k",
 	}
 
-	filter := fmt.Sprintf("[0:v]format=yuv420p,scale=-2:%d[vout]", highestQuality.H)
+	// Use appropriate pixel format based on bit depth
+	pixelFormat := "yuv420p"
+	if bitDepth == 10 {
+		pixelFormat = "yuv420p10le"
+	} else if bitDepth >= 12 {
+		pixelFormat = "yuv420p12le"
+	}
+
+	// Build filter - convert 10-bit to 8-bit for H.264 encoding
+	var filter string
+	if isHDR {
+		// For HDR 10-bit, use scale to convert to 8-bit with color matrix
+		filter = fmt.Sprintf("[0:v]scale=-2:%d:in_color_matrix=bt709:out_color_matrix=bt709,format=%s[vout]", highestQuality.H, pixelFormat)
+	} else {
+		// For SDR, apply colorspace filter
+		filter = fmt.Sprintf("[0:v]format=%s,colorspace=bt709,scale=-2:%d[vout]", pixelFormat, highestQuality.H)
+	}
 
 	args := []string{
+		"-thread_queue_size", "16",  // Reduce thread queue size to avoid excessive buffering
 		"-i", inputPath,
 		"-filter_complex", filter,
 		"-map", "[vout]",
@@ -328,10 +372,12 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 	
 	args = append(args,
 		"-var_stream_map", vsm,
-		"-master_pl_name", "master.m3u8",
 		"-hls_segment_filename", filepath.Join(outputDir, "%v/segment_%03d.ts"),
 		filepath.Join(outputDir, "%v/playlist.m3u8"),
 	)
+
+	// Generate master playlist manually after encoding (not using FFmpeg's -master_pl_name)
+	// This allows us to include captions track
 
 	fmt.Printf("Using encoder: %s (GPU: %v)\n", selectedEncoder.Name, selectedEncoder.IsGPU)
 
@@ -380,6 +426,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 		
 		// Rebuild args with CPU encoder
 		args := []string{
+			"-thread_queue_size", "16",  // Reduce thread queue size
 			"-i", inputPath,
 			"-filter_complex", filter,
 			"-map", "[vout]",
@@ -416,7 +463,6 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 			"-hls_list_size", "0",
 			"-progress", "pipe:1",
 			"-var_stream_map", vsm,
-			"-master_pl_name", "master.m3u8",
 			"-hls_segment_filename", filepath.Join(outputDir, "%v/segment_%03d.ts"),
 			filepath.Join(outputDir, "%v/playlist.m3u8"),
 		)
@@ -459,12 +505,74 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 		err = cmd.Wait()
 	}
 	
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Generate master playlist with ONLY the highest quality (since that's all that exists)
+	// Remaining qualities will update this when they're done
+	err = generateMasterPlaylist(outputDir, []Resolution{highestQuality}, hasCaptions)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func generateMasterPlaylist(outputDir string, selected []Resolution) error {
+// extractCaptions extracts subtitle/caption streams from video and converts to WebVTT format
+func extractCaptions(inputPath, videoID, outputDir string) (bool, error) {
+	// First, check if video has subtitle streams
+	ffprobeCmd := exec.Command("ffprobe", 
+		"-v", "error",
+		"-select_streams", "s",
+		"-show_entries", "stream=index,codec_type",
+		"-of", "csv=p=0",
+		inputPath,
+	)
+	
+	output, err := ffprobeCmd.Output()
+	if err != nil || len(output) == 0 {
+		fmt.Println("No subtitles found in video:", err)
+		return false, nil
+	}
+	
+	fmt.Println("Found subtitles, extracting...")
+	
+	// Extract all subtitle streams to WebVTT format
+	// Use output pattern: captions.vtt for the main caption track
+	captionsPath := filepath.Join(outputDir, "captions.vtt")
+	
+	ffmpegCmd := exec.Command("ffmpeg",
+		"-i", inputPath,
+		"-map", "0:s:0",  // Select first subtitle stream
+		captionsPath,
+	)
+	
+	if err := ffmpegCmd.Run(); err != nil {
+		fmt.Println("Warning: Failed to extract captions:", err)
+		return false, nil
+	}
+	
+	// Verify file was created and has content
+	if fileInfo, err := os.Stat(captionsPath); err != nil || fileInfo.Size() == 0 {
+		fmt.Println("Caption file empty or not created")
+		os.Remove(captionsPath)
+		return false, nil
+	}
+	
+	fmt.Println("Successfully extracted captions to:", captionsPath)
+	return true, nil
+}
+
+func generateMasterPlaylist(outputDir string, selected []Resolution, hasCaptions bool) error {
 	// Generate master.m3u8 with all variants
 	masterContent := "#EXTM3U\n#EXT-X-VERSION:3\n"
+	
+	// Add caption track if available
+	if hasCaptions {
+		masterContent += `#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",LANGUAGE="en",NAME="English",DEFAULT=YES,INSTREAM-ID="CC1"
+`
+	}
 	
 	// Bandwidths for each quality (approximate)
 	bandwidths := map[string]string{
@@ -479,9 +587,19 @@ func generateMasterPlaylist(outputDir string, selected []Resolution) error {
 
 	for _, res := range selected {
 		bandwidth := bandwidths[res.Name]
-		masterContent += fmt.Sprintf(`#EXT-X-STREAM-INF:BANDWIDTH=%s,RESOLUTION=%dx%d
+		ccAttr := ""
+		if hasCaptions {
+			ccAttr = ",CLOSED-CAPTIONS=\"cc\""
+		}
+		masterContent += fmt.Sprintf(`#EXT-X-STREAM-INF:BANDWIDTH=%s,RESOLUTION=%dx%d%s
 %s/playlist.m3u8
-`, bandwidth, res.W, res.H, res.Name)
+`, bandwidth, res.W, res.H, ccAttr, res.Name)
+	}
+	
+	// Add caption file URI if available
+	if hasCaptions {
+		masterContent += `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,FORCED=NO,LANGUAGE="en",URI="captions.vtt"
+`
 	}
 
 	masterPath := filepath.Join(outputDir, "master.m3u8")
@@ -491,10 +609,13 @@ func generateMasterPlaylist(outputDir string, selected []Resolution) error {
 	}
 	
 	fmt.Println("Generated master playlist with", len(selected), "variants")
+	if hasCaptions {
+		fmt.Println("Master playlist includes captions track")
+	}
 	return nil
 }
 
-func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, selected []Resolution, totalFrames int, multiplier float64, outputDir string) error {
+func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, selected []Resolution, totalFrames int, multiplier float64, outputDir string, hasCaptions bool, bitDepth int, isHDR bool) error {
 	// Encode remaining lower quality variants
 	if len(selected) <= 1 {
 		fmt.Println("No remaining qualities to encode")
@@ -502,7 +623,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	}
 
 	remainingQualitities := selected[1:]
-	fmt.Printf("Encoding remaining %d quality variants\n", len(remainingQualitities))
+	fmt.Printf("Encoding remaining %d quality variants (bit depth: %d)\n", len(remainingQualitities), bitDepth)
 	
 	// Check if video has audio
 	videoHasAudio := hasAudio(inputPath)
@@ -538,7 +659,24 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 		"144p":  "300k",
 	}
 
-	filter := "[0:v]format=yuv420p,split=" + fmt.Sprint(len(remainingQualitities))
+	// Use appropriate pixel format and color space based on bit depth
+	pixelFormat := "yuv420p"
+	if bitDepth == 10 {
+		pixelFormat = "yuv420p10le"
+	} else if bitDepth >= 12 {
+		pixelFormat = "yuv420p12le"
+	}
+
+	// Build filter - GPU doesn't handle HDR tone mapping well, so skip for speed
+	// CPU fallback will handle color conversion
+	var filter string
+	if isHDR {
+		// For HDR on GPU, just convert format without tone mapping (fast but colors may be slightly off)
+		filter = "[0:v]format=" + pixelFormat + ",split=" + fmt.Sprint(len(remainingQualitities))
+	} else {
+		// For SDR, apply colorspace filter
+		filter = "[0:v]format=" + pixelFormat + ",colorspace=bt709,split=" + fmt.Sprint(len(remainingQualitities))
+	}
 	for i := range remainingQualitities {
 		filter += fmt.Sprintf("[v%d]", i)
 	}
@@ -549,6 +687,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	}
 
 	args := []string{
+		"-thread_queue_size", "16",  // Reduce thread queue size
 		"-i", inputPath,
 		"-filter_complex", filter,
 	}
@@ -658,10 +797,21 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	if err != nil && selectedEncoder.IsGPU {
 		fmt.Printf("GPU encoding failed for remaining qualities, retrying with CPU (libx264)...\n")
 		
-		// Rebuild args with CPU encoder (libx264)
+		// CPU fallback: simple format conversion for 10-bit to 8-bit
+		var cpuFilter string
+		if isHDR {
+			// For HDR 10-bit, use scale to convert to 8-bit
+			cpuFilter = "[0:v]scale=-2:-2:in_color_matrix=bt709:out_color_matrix=bt709,format=" + pixelFormat + ",split=" + fmt.Sprint(len(remainingQualitities))
+		} else {
+			// For SDR, apply colorspace filter
+			cpuFilter = "[0:v]format=" + pixelFormat + ",colorspace=bt709,split=" + fmt.Sprint(len(remainingQualitities))
+		}
+		
+		// Rebuild args with CPU encoder AND proper filter
 		cpuArgs := []string{
+			"-thread_queue_size", "16",  // Reduce thread queue size
 			"-i", inputPath,
-			"-filter_complex", filter,
+			"-filter_complex", cpuFilter,
 		}
 
 		// Map all video filter outputs
@@ -725,8 +875,8 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 		return err
 	}
 
-	// Regenerate master.m3u8 with all variants
-	err = generateMasterPlaylist(outputDir, selected)
+	// Regenerate master.m3u8 with all variants (including caption track if available)
+	err = generateMasterPlaylist(outputDir, selected, hasCaptions)
 	if err != nil {
 		fmt.Printf("Error generating master playlist for %s: %v\n", videoID, err)
 		return err
@@ -736,7 +886,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	return nil
 }
 
-func transcodeWithProgress(inputPath, videoID string, database *sql.DB) error {
+func transcodeWithProgress(inputPath, videoID string, database *sql.DB) (int, error) {
 	// Get total frames first
 	totalFrames, err := getTotalFrames(inputPath)
 	if err != nil {
@@ -749,14 +899,24 @@ func transcodeWithProgress(inputPath, videoID string, database *sql.DB) error {
 
 	width, height, err := transcoder.GetVideoResolution(inputPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	fps, _ := transcoder.GetVideoFrameRate(inputPath)
 	multiplier := transcoder.ApplyFrameRateMultiplier(fps)
 
+	// Detect bit depth (8, 10, 12, etc.)
+	bitDepth := transcoder.GetVideoBitDepth(inputPath)
+
+	// Detect if video is HDR (smpte2084, arib-std-b67, etc.)
+	isHDR := transcoder.IsHDRVideo(inputPath)
+
 	fmt.Println("Source resolution:", width, "x", height)
 	fmt.Printf("Frame rate multiplier: %.2fx\n", multiplier)
+	fmt.Printf("Bit depth: %d-bit\n", bitDepth)
+	if isHDR {
+		fmt.Println("Video type: HDR (colorspace filter will be skipped)")
+	}
 
 	all := []Resolution{
 		{"2160p", 2160, 3840},
@@ -781,21 +941,28 @@ func transcodeWithProgress(inputPath, videoID string, database *sql.DB) error {
 		selected = []Resolution{{"144p", height, width}}
 	}
 
-	// First pass: encode highest quality only
-	err = transcodeHighestQualityOnly(inputPath, videoID, database, selected, totalFrames, multiplier, outputDir)
+	// Extract captions from original video (before encoding)
+	hasCaptions, err := extractCaptions(inputPath, videoID, outputDir)
 	if err != nil {
-		return err
+		fmt.Printf("Warning: Failed to process captions for %s: %v\n", videoID, err)
+		// Continue even if caption extraction fails
+	}
+
+	// First pass: encode highest quality only
+	err = transcodeHighestQualityOnly(inputPath, videoID, database, selected, totalFrames, multiplier, outputDir, hasCaptions, bitDepth, isHDR)
+	if err != nil {
+		return 0, err
 	}
 
 	// Second pass: encode remaining qualities in background (don't wait for completion)
 	go func() {
-		err := transcodeRemainingQualities(inputPath, videoID, database, selected, totalFrames, multiplier, outputDir)
+		err := transcodeRemainingQualities(inputPath, videoID, database, selected, totalFrames, multiplier, outputDir, hasCaptions, bitDepth, isHDR)
 		if err != nil {
 			fmt.Printf("Background encoding error for %s: %v\n", videoID, err)
 		}
 	}()
 
-	return nil
+	return width, nil
 }
 
 func processDownloadJob(job *queue.DownloadJob) {
@@ -884,6 +1051,9 @@ func main() {
 			continue
 		}
 
+		// Convert Windows UNC paths to WSL Linux paths if worker is running in WSL
+		job.FilePath = convertWindowsPathToWSL(job.FilePath)
+		
 		// Translate WSL paths to Windows interop format if running on Windows
 		job.FilePath = translatePath(job.FilePath)
 
@@ -926,7 +1096,7 @@ func main() {
 
 		// 3. transcode highest quality (10-90% progress) with real-time progress tracking
 		// Lower quality variants will encode in the background
-		err = transcodeWithProgress(job.FilePath, job.VideoID, database)
+		width, err := transcodeWithProgress(job.FilePath, job.VideoID, database)
 		if err != nil {
 			fmt.Println("Transcode error:", err)
 			db.UpdateVideoStatus(database, job.VideoID, "failed")
@@ -947,12 +1117,13 @@ func main() {
 
 		_, err = database.Exec(
 			`UPDATE videos 
-			SET status=$1, hls_path=$2, thumbnail_url=$3, progress=$4
-			WHERE id=$5`,
+			SET status=$1, hls_path=$2, thumbnail_url=$3, progress=$4, width=$5
+			WHERE id=$6`,
 			"ready",
 			hlsPath,
 			thumbURL,
 			100,
+			width,
 			job.VideoID,
 		)
 

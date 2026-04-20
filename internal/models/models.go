@@ -5,6 +5,14 @@ import (
 	"time"
 )
 
+type Category struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type Video struct {
 	ID           string    `json:"id"`
 	Title        string    `json:"title"`
@@ -17,7 +25,10 @@ type Video struct {
 	HLSPath	 string    `json:"hls_path"`
 	ThumbnailURL string    `json:"thumbnail_url"`
 	HasCustomThumbnail bool `json:"has_custom_thumbnail"`
+	Explicit     bool      `json:"explicit"`
 	ChannelID string `json:"channel_id"`
+	Width        int       `json:"width"`
+	Categories   []Category `json:"categories"`
 }
 
 type Stream struct {
@@ -42,6 +53,7 @@ type Channel struct {
 	Description string         `json:"description"`
 	CreatedAt   time.Time      `json:"created_at"`
 	AvatarURL   sql.NullString `json:"avatar_url"`
+	Verified    bool           `json:"verified"`
 }
 
 type Comment struct {
