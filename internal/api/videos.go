@@ -19,7 +19,6 @@ import (
 	"github.com/gil/giltube/internal/db"
 )
 
-// Helper function to safely parse integer query parameters
 func parseInt(value string, defaultVal int) int {
 	if value == "" {
 		return defaultVal
@@ -75,10 +74,8 @@ func (s *Server) uploadVideo(c *gin.Context) {
 	return
 	}
 
-	// Handle category assignments if provided
 	categoryIDsStr := c.PostForm("category_ids")
 	if categoryIDsStr != "" {
-		// Parse comma-separated category IDs
 		categoryIDs := strings.Split(categoryIDsStr, ",")
 		var validCategoryIDs []string
 		for _, id := range categoryIDs {
@@ -121,14 +118,13 @@ func (s *Server) listVideos(c *gin.Context) {
 		Channel ChannelResponse `json:"channel"`
 	}
 
-	// Get pagination parameters
 	limit := 12
 	offset := 0
 	if l := c.DefaultQuery("limit", ""); l != "" {
 		if parsed := parseInt(l, 12); parsed > 0 {
 			limit = parsed
 			if limit > 100 {
-				limit = 100 // Cap at 100 to prevent abuse
+				limit = 100
 			}
 		}
 	}
@@ -138,7 +134,6 @@ func (s *Server) listVideos(c *gin.Context) {
 		}
 	}
 
-	// Public endpoint - return all published videos ordered by recent with pagination
 	rows, err := s.db.Query(`
 		SELECT 
 			v.id,
@@ -263,14 +258,12 @@ func (s *Server) listMyVideos(c *gin.Context) {
 		return
 	}
 
-	// Get channel_id from query params (required)
 	channelID := c.Query("channel_id")
 	if channelID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id is required"})
 		return
 	}
 
-	// Verify that the channel belongs to this user
 	var channelUserID string
 	err := s.db.QueryRow(
 		"SELECT user_id FROM channels WHERE id = $1",
@@ -296,8 +289,6 @@ func (s *Server) listMyVideos(c *gin.Context) {
 		Channel ChannelResponse `json:"channel"`
 	}
 
-	// User's videos from specific channel - return ALL videos regardless of status
-	// (uploaded, processing, ready, failed, etc.)
 	rows, err := s.db.Query(`
 		SELECT 
 			v.id,
@@ -409,9 +400,8 @@ func (s *Server) listMyVideos(c *gin.Context) {
 
 func (s *Server) streamVideo(c *gin.Context) {
 	videoID := c.Param("id")
-	requestPath := c.Param("filepath") // includes /master.m3u8 or /0/segment.ts
+	requestPath := c.Param("filepath")
 
-	// 1. Check video exists + status
 	var status string
 	err := s.db.QueryRow(
 		"SELECT status FROM videos WHERE id=$1",
@@ -428,17 +418,14 @@ func (s *Server) streamVideo(c *gin.Context) {
 		return
 	}
 
-	// 2. Build full path
 	baseDir := filepath.Join(os.Getenv("HOME"), "giltube/output", videoID)
 	fullPath := filepath.Join(baseDir, requestPath)
 
-	// 🔥 IMPORTANT: prevent path traversal attack
 	if !strings.HasPrefix(fullPath, baseDir) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
 		return
 	}
 
-	// 3. Serve file
 	c.File(fullPath)
 }
 
@@ -565,7 +552,6 @@ func (s *Server) likeVideo(c *gin.Context) {
 		return
 	}
 
-	// Check if already liked
 	liked, err := db.CheckIfLiked(s.db, videoID, channelID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "check failed"})
@@ -576,7 +562,6 @@ func (s *Server) likeVideo(c *gin.Context) {
 		return
 	}
 
-	// Create like
 	likeID := uuid.New().String()
 	err = db.CreateLike(s.db, likeID, videoID, channelID)
 	if err != nil {
@@ -584,7 +569,6 @@ func (s *Server) likeVideo(c *gin.Context) {
 		return
 	}
 
-	// Get updated likes count
 	likesCount, _ := db.GetLikesCount(s.db, videoID)
 	c.JSON(http.StatusOK, gin.H{"likes": likesCount, "liked": true})
 }
@@ -598,7 +582,6 @@ func (s *Server) unlikeVideo(c *gin.Context) {
 		return
 	}
 
-	// Check if liked
 	liked, err := db.CheckIfLiked(s.db, videoID, channelID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "check failed"})
@@ -609,14 +592,12 @@ func (s *Server) unlikeVideo(c *gin.Context) {
 		return
 	}
 
-	// Delete like
 	err = db.DeleteLike(s.db, videoID, channelID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "unlike failed"})
 		return
 	}
 
-	// Get updated likes count
 	likesCount, _ := db.GetLikesCount(s.db, videoID)
 	c.JSON(http.StatusOK, gin.H{"likes": likesCount, "liked": false})
 }

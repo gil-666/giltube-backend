@@ -23,34 +23,24 @@ type Resolution struct {
 	W    int
 }
 
-// getOutputDir returns the base output directory, supporting both WSL and native Windows
 func getOutputDir() string {
-	// Check for explicit environment variable first
 	if outputDir := os.Getenv("GILTUBE_OUTPUT_DIR"); outputDir != "" {
 		return outputDir
 	}
 	
-	// Default behavior: WSL on Windows or native Linux
 	if runtime.GOOS == "windows" {
-		// Windows worker accessing WSL filesystem via interop
-		// Format: \\wsl.localhost\Ubuntu\home\gil\giltube\output
 		return "\\\\wsl.localhost\\Ubuntu\\home\\gil\\giltube\\output"
 	}
 	
-	// Linux/WSL native: use HOME environment variable
 	return filepath.Join(os.Getenv("HOME"), "giltube/output")
 }
 
-// translatePath converts WSL paths to Windows WSL interop paths when running on Windows
 func translatePath(inputPath string) string {
 	if runtime.GOOS != "windows" {
 		return inputPath
 	}
 	
-	// Convert /tmp/file to \\wsl.localhost\Ubuntu\tmp\file
-	// Convert /home/path to \\wsl.localhost\Ubuntu\home\path
 	if strings.HasPrefix(inputPath, "/") {
-		// Remove leading slash and convert path separators
 		wslPath := strings.TrimPrefix(inputPath, "/")
 		wslPath = strings.ReplaceAll(wslPath, "/", "\\")
 		return "\\\\wsl.localhost\\Ubuntu\\" + wslPath
@@ -59,16 +49,12 @@ func translatePath(inputPath string) string {
 	return inputPath
 }
 
-// convertWindowsPathToWSL converts Windows UNC paths to native WSL Linux paths
-// This is needed when the worker runs inside WSL but receives Windows paths
 func convertWindowsPathToWSL(inputPath string) string {
 	if runtime.GOOS != "linux" {
 		return inputPath
 	}
 	
-	// Handle Windows UNC paths: \\wsl.localhost\Ubuntu\path\to\file
 	if strings.HasPrefix(inputPath, "\\\\wsl.localhost\\Ubuntu\\") {
-		// Remove the prefix and convert backslashes to forward slashes
 		linuxPath := strings.TrimPrefix(inputPath, "\\\\wsl.localhost\\Ubuntu")
 		linuxPath = strings.ReplaceAll(linuxPath, "\\", "/")
 		if !strings.HasPrefix(linuxPath, "/") {
@@ -77,9 +63,7 @@ func convertWindowsPathToWSL(inputPath string) string {
 		return linuxPath
 	}
 	
-	// Handle plain Windows paths like C:\path\to\file (unlikely but handle it)
 	if strings.Contains(inputPath, "\\") && len(inputPath) > 1 && inputPath[1] == ':' {
-		// This is a Windows absolute path, just convert separators (shouldn't happen in WSL)
 		return strings.ReplaceAll(inputPath, "\\", "/")
 	}
 	
@@ -103,7 +87,6 @@ func getTotalFrames(inputPath string) (int, error) {
 	}
 
 	frameStr := strings.TrimSpace(string(out))
-	// Remove any trailing comma from the output
 	frameStr = strings.TrimSuffix(frameStr, ",")
 	frames, err := strconv.Atoi(frameStr)
 	if err != nil {
@@ -158,22 +141,19 @@ func isQualityEncoded(outputDir string, qualityName string) bool {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		if scanner.Text() == "#EXT-X-ENDLIST" {
-			return true // Encoding completed successfully
+			return true
 		}
 	}
 	
-	// Playlist exists but no end tag means encoding was interrupted
 	return false
 }
 
-// EncoderType represents the available video encoders
 type EncoderType struct {
-	Name     string // Name for logging (e.g., "hevc_amf", "libx264")
-	Codec    string // FFmpeg codec name
-	IsGPU    bool   // Whether this is a GPU encoder
+	Name  string
+	Codec string
+	IsGPU bool
 }
 
-// detectGPUEncoder checks if GPU encoding is available
 func detectGPUEncoder() *EncoderType {
 	// Check for AMD GPU encoders
 	var encoders []string
