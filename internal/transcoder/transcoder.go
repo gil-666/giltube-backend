@@ -331,6 +331,7 @@ func GenerateThumbnail(inputPath, videoID, outputDir string) error {
 
 	cmd := exec.Command(
 		"ffmpeg",
+		"-y",                 // Auto-overwrite output files
 		"-ss", "3",           // Seek to 3 seconds
 		"-thread_queue_size", "8",   // Reduce thread queue size to avoid excessive buffering
 		"-i", inputPath,

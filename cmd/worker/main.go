@@ -132,6 +132,40 @@ func hasAudio(inputPath string) bool {
 	return output == "audio"
 }
 
+// isQualityEncoded checks if a specific quality variant is already encoded
+func isQualityEncoded(outputDir string, qualityName string) bool {
+	playlistPath := filepath.Join(outputDir, qualityName, "playlist.m3u8")
+	
+	// Check if playlist exists
+	if _, err := os.Stat(playlistPath); err != nil {
+		return false
+	}
+	
+	// Check if at least one segment exists
+	segmentPattern := filepath.Join(outputDir, qualityName, "segment_*.ts")
+	matches, err := filepath.Glob(segmentPattern)
+	if err != nil || len(matches) == 0 {
+		return false
+	}
+	
+	// Check if playlist has #EXT-X-ENDLIST (indicates encoding completed)
+	file, err := os.Open(playlistPath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if scanner.Text() == "#EXT-X-ENDLIST" {
+			return true // Encoding completed successfully
+		}
+	}
+	
+	// Playlist exists but no end tag means encoding was interrupted
+	return false
+}
+
 // EncoderType represents the available video encoders
 type EncoderType struct {
 	Name     string // Name for logging (e.g., "hevc_amf", "libx264")
@@ -176,10 +210,12 @@ func init() {
 // For GPU encoders, uses bitrate; for CPU, uses crf
 func getEncoderArgs(encoder *EncoderType, bitrate, maxrate, bufsize string) []string {
 	if encoder.IsGPU {
-		// AMD VCE/AMF settings - use minimal parameters to avoid init errors
+		// AMD h264_amf settings with proper parameters
 		args := []string{
 			"-c:v", encoder.Codec,
 			"-b:v", bitrate,
+			"-maxrate:v", maxrate,
+			"-bufsize:v", bufsize,
 		}
 		
 		return args
@@ -264,6 +300,12 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 	highestQuality := selected[0]
 	fmt.Printf("Encoding highest quality first: %s (bit depth: %d)\n", highestQuality.Name, bitDepth)
 	
+	// Check if highest quality is already encoded (for resume capability)
+	if isQualityEncoded(outputDir, highestQuality.Name) {
+		fmt.Printf("Highest quality %s already encoded, skipping to remaining qualities\n", highestQuality.Name)
+		return nil
+	}
+	
 	// Check if video has audio
 	videoHasAudio := hasAudio(inputPath)
 	fmt.Printf("Video has audio: %v\n", videoHasAudio)
@@ -298,23 +340,9 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 		"144p":  "300k",
 	}
 
-	// Use appropriate pixel format based on bit depth
-	pixelFormat := "yuv420p"
-	if bitDepth == 10 {
-		pixelFormat = "yuv420p10le"
-	} else if bitDepth >= 12 {
-		pixelFormat = "yuv420p12le"
-	}
-
-	// Build filter - convert 10-bit to 8-bit for H.264 encoding
-	var filter string
-	if isHDR {
-		// For HDR 10-bit, use scale to convert to 8-bit with color matrix
-		filter = fmt.Sprintf("[0:v]scale=-2:%d:in_color_matrix=bt709:out_color_matrix=bt709,format=%s[vout]", highestQuality.H, pixelFormat)
-	} else {
-		// For SDR, apply colorspace filter
-		filter = fmt.Sprintf("[0:v]format=%s,colorspace=bt709,scale=-2:%d[vout]", pixelFormat, highestQuality.H)
-	}
+	// Build filter - scale to target resolution
+	// H.264 requires yuv420p, so force that format
+	filter := fmt.Sprintf("[0:v]format=yuv420p,scale=-2:%d[vout]", highestQuality.H)
 
 	args := []string{
 		"-thread_queue_size", "16",  // Reduce thread queue size to avoid excessive buffering
@@ -543,6 +571,7 @@ func extractCaptions(inputPath, videoID, outputDir string) (bool, error) {
 	captionsPath := filepath.Join(outputDir, "captions.vtt")
 	
 	ffmpegCmd := exec.Command("ffmpeg",
+		"-y",
 		"-i", inputPath,
 		"-map", "0:s:0",  // Select first subtitle stream
 		captionsPath,
@@ -622,8 +651,31 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 		return nil
 	}
 
-	remainingQualitities := selected[1:]
-	fmt.Printf("Encoding remaining %d quality variants (bit depth: %d)\n", len(remainingQualitities), bitDepth)
+	remainingQualities := selected[1:]
+	
+	// Filter out already-encoded qualities (for resume capability)
+	var qualitiesToEncode []Resolution
+	var alreadyEncoded []string
+	
+	for _, q := range remainingQualities {
+		if isQualityEncoded(outputDir, q.Name) {
+			alreadyEncoded = append(alreadyEncoded, q.Name)
+		} else {
+			qualitiesToEncode = append(qualitiesToEncode, q)
+		}
+	}
+	
+	if len(alreadyEncoded) > 0 {
+		fmt.Printf("Resuming interrupted encode - skipping already-encoded qualities: %v\n", alreadyEncoded)
+	}
+	
+	if len(qualitiesToEncode) == 0 {
+		fmt.Println("All quality variants already encoded, skipping remaining qualities stage")
+		// Still need to regenerate master playlist
+		return generateMasterPlaylist(outputDir, selected, hasCaptions)
+	}
+	
+	fmt.Printf("Encoding %d remaining quality variants (bit depth: %d)\n", len(qualitiesToEncode), bitDepth)
 	
 	// Check if video has audio
 	videoHasAudio := hasAudio(inputPath)
@@ -659,30 +711,15 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 		"144p":  "300k",
 	}
 
-	// Use appropriate pixel format and color space based on bit depth
-	pixelFormat := "yuv420p"
-	if bitDepth == 10 {
-		pixelFormat = "yuv420p10le"
-	} else if bitDepth >= 12 {
-		pixelFormat = "yuv420p12le"
-	}
-
-	// Build filter - GPU doesn't handle HDR tone mapping well, so skip for speed
-	// CPU fallback will handle color conversion
-	var filter string
-	if isHDR {
-		// For HDR on GPU, just convert format without tone mapping (fast but colors may be slightly off)
-		filter = "[0:v]format=" + pixelFormat + ",split=" + fmt.Sprint(len(remainingQualitities))
-	} else {
-		// For SDR, apply colorspace filter
-		filter = "[0:v]format=" + pixelFormat + ",colorspace=bt709,split=" + fmt.Sprint(len(remainingQualitities))
-	}
-	for i := range remainingQualitities {
+	// Build filter - simple format and scale (H.264 requires yuv420p)
+	// Split into one output per quality variant
+	filter := "[0:v]format=yuv420p,split=" + fmt.Sprint(len(qualitiesToEncode))
+	for i := range qualitiesToEncode {
 		filter += fmt.Sprintf("[v%d]", i)
 	}
 	filter += ";"
 
-	for i, r := range remainingQualitities {
+	for i, r := range qualitiesToEncode {
 		filter += fmt.Sprintf("[v%d]scale=-2:%d[v%dout];", i, r.H, i)
 	}
 
@@ -693,19 +730,19 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	}
 
 	// Map all video filter outputs
-	for i := range remainingQualitities {
+	for i := range qualitiesToEncode {
 		args = append(args, "-map", fmt.Sprintf("[v%dout]", i))
 	}
 
 	// Map audio once for each variant (only if audio exists)
 	if videoHasAudio {
-		for range remainingQualitities {
+		for range qualitiesToEncode {
 			args = append(args, "-map", "0:a:0")
 		}
 	}
 
 	// Set codec for each video stream
-	for i := range remainingQualitities {
+	for i := range qualitiesToEncode {
 		codecName := "libx264"
 		if selectedEncoder.IsGPU {
 			codecName = selectedEncoder.Codec
@@ -716,21 +753,21 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	// Add encoder-specific settings
 	if selectedEncoder.IsGPU && runtime.GOOS == "windows" {
 		// Windows GPU: just use bitrate (minimal parameters)
-		for i, r := range remainingQualitities {
+		for i, r := range qualitiesToEncode {
 			args = append(args,
 				"-b:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bitrateMap[r.Name], multiplier),
 			)
 		}
 	} else if selectedEncoder.IsGPU {
 		// Linux GPU: bitrate-based
-		for i, r := range remainingQualitities {
+		for i, r := range qualitiesToEncode {
 			args = append(args,
 				"-b:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bitrateMap[r.Name], multiplier),
 			)
 		}
 	} else {
 		// CPU encoding
-		for i, r := range remainingQualitities {
+		for i, r := range qualitiesToEncode {
 			args = append(args,
 				"-preset:v:"+fmt.Sprint(i), "veryfast",
 				"-crf:v:"+fmt.Sprint(i), "20",
@@ -761,7 +798,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	)
 
 	var vsm string
-	for i, r := range remainingQualitities {
+	for i, r := range qualitiesToEncode {
 		vsm += fmt.Sprintf("v:%d", i)
 		if videoHasAudio {
 			vsm += fmt.Sprintf(",a:%d", i)
@@ -779,7 +816,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	if selectedEncoder.IsGPU {
 		encoderMsg = fmt.Sprintf("%s (GPU)", selectedEncoder.Name)
 	}
-	fmt.Printf("Encoding remaining %d qualities with: %s\n", len(remainingQualitities), encoderMsg)
+	fmt.Printf("Encoding remaining %d qualities with: %s\n", len(qualitiesToEncode), encoderMsg)
 
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.Stdout = os.Stdout
@@ -797,15 +834,8 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	if err != nil && selectedEncoder.IsGPU {
 		fmt.Printf("GPU encoding failed for remaining qualities, retrying with CPU (libx264)...\n")
 		
-		// CPU fallback: simple format conversion for 10-bit to 8-bit
-		var cpuFilter string
-		if isHDR {
-			// For HDR 10-bit, use scale to convert to 8-bit
-			cpuFilter = "[0:v]scale=-2:-2:in_color_matrix=bt709:out_color_matrix=bt709,format=" + pixelFormat + ",split=" + fmt.Sprint(len(remainingQualitities))
-		} else {
-			// For SDR, apply colorspace filter
-			cpuFilter = "[0:v]format=" + pixelFormat + ",colorspace=bt709,split=" + fmt.Sprint(len(remainingQualitities))
-		}
+		// CPU fallback: simple format conversion
+		cpuFilter := "[0:v]format=yuv420p,split=" + fmt.Sprint(len(qualitiesToEncode))
 		
 		// Rebuild args with CPU encoder AND proper filter
 		cpuArgs := []string{
@@ -815,19 +845,19 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 		}
 
 		// Map all video filter outputs
-		for i := range remainingQualitities {
+		for i := range qualitiesToEncode {
 			cpuArgs = append(cpuArgs, "-map", fmt.Sprintf("[v%dout]", i))
 		}
 
 		// Map audio
 		if videoHasAudio {
-			for range remainingQualitities {
+			for range qualitiesToEncode {
 				cpuArgs = append(cpuArgs, "-map", "0:a:0")
 			}
 		}
 
 		// Add CPU encoding settings for all qualities
-		for i, r := range remainingQualitities {
+		for i, r := range qualitiesToEncode {
 			cpuArgs = append(cpuArgs,
 				"-c:v:"+fmt.Sprint(i), "libx264",
 				"-preset:v:"+fmt.Sprint(i), "veryfast",

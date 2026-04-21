@@ -87,6 +87,7 @@ func (s *Server) setupRoutes() {
 		api.POST("/videos/:id/like", s.likeVideo)
 		api.DELETE("/videos/:id/like", s.unlikeVideo)
 		api.GET("/videos/:id/liked", s.checkIfLiked)
+		api.POST("/videos/:id/re-encode", s.reEncodeVideo)
 		api.GET("/videos/:id/comments", s.getVideoComments)
 		api.GET("/channels/:channel_id/analytics", s.getChannelAnalytics)
 		api.POST("/videos/:id/comments", s.createComment)

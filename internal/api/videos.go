@@ -914,6 +914,63 @@ func (s *Server) deleteVideo(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "video deleted successfully"})
 }
 
+func (s *Server) reEncodeVideo(c *gin.Context) {
+	videoID := c.Param("id")
+	
+	// Check if video exists
+	var video models.Video
+	err := s.db.QueryRow("SELECT id, status FROM videos WHERE id = $1", videoID).Scan(&video.ID, &video.Status)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "video not found"})
+		return
+	}
+	
+	// Get file path from request (user must provide the original video file)
+	filePath := c.PostForm("file_path")
+	
+	// If no file path provided, try to get uploaded file
+	if filePath == "" {
+		file, err := c.FormFile("video")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "must provide file_path or upload video file"})
+			return
+		}
+		
+		// Save uploaded file to temp
+		tempPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s-%s", videoID, file.Filename))
+		if err := c.SaveUploadedFile(file, tempPath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save file"})
+			return
+		}
+		filePath = tempPath
+	} else {
+		// Verify file exists if path provided
+		if _, err := os.Stat(filePath); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file_path does not exist"})
+			return
+		}
+	}
+	
+	// Queue for re-encoding
+	err = s.queue.Enqueue(queue.Job{VideoID: videoID, FilePath: filePath})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue video"})
+		return
+	}
+	
+	// Update video status
+	_, err = s.db.Exec("UPDATE videos SET status = $1, progress = 0 WHERE id = $2", "processing", videoID)
+	if err != nil {
+		fmt.Printf("Warning: failed to update video status: %v\n", err)
+	}
+	
+	c.JSON(http.StatusOK, gin.H{
+		"message": "video queued for re-encoding",
+		"video_id": videoID,
+		"file_path": filePath,
+	})
+}
+
 func (s *Server) incrementViews(c *gin.Context) {
 	videoID := c.Param("id")
 
