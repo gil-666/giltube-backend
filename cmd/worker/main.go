@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"github.com/gil/giltube/config"
 	"github.com/gil/giltube/internal/queue"
@@ -651,15 +652,10 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	
 	if len(qualitiesToEncode) == 0 {
 		fmt.Println("All quality variants already encoded, skipping remaining qualities stage")
-		// Still need to regenerate master playlist
 		return generateMasterPlaylist(outputDir, selected, hasCaptions)
 	}
-	
-	fmt.Printf("Encoding %d remaining quality variants (bit depth: %d)\n", len(qualitiesToEncode), bitDepth)
-	
-	// Check if video has audio
-	videoHasAudio := hasAudio(inputPath)
-	fmt.Printf("Video has audio: %v\n", videoHasAudio)
+
+	fmt.Printf("Encoding %d remaining quality variants in parallel with libx264 (bit depth: %d)\n", len(qualitiesToEncode), bitDepth)
 
 	bitrateMap := map[string]string{
 		"2160p": "10000k",
@@ -691,209 +687,105 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 		"144p":  "300k",
 	}
 
-	// Build filter - simple format and scale (H.264 requires yuv420p)
-	// Split into one output per quality variant
-	filter := "[0:v]format=yuv420p,split=" + fmt.Sprint(len(qualitiesToEncode))
-	for i := range qualitiesToEncode {
-		filter += fmt.Sprintf("[v%d]", i)
-	}
-	filter += ";"
+	// Use goroutines to encode multiple qualities in parallel (max 3 concurrent)
+	semaphore := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	errors := make([]error, len(qualitiesToEncode))
 
-	for i, r := range qualitiesToEncode {
-		filter += fmt.Sprintf("[v%d]scale=-2:%d[v%dout];", i, r.H, i)
-	}
+	for idx, resolution := range qualitiesToEncode {
+		wg.Add(1)
+		go func(index int, res Resolution) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // Acquire semaphore
+			defer func() { <-semaphore }() // Release semaphore
 
-	args := []string{
-		"-thread_queue_size", "16",  // Reduce thread queue size
-		"-i", inputPath,
-		"-filter_complex", filter,
-	}
+			fmt.Printf("Encoding quality: %s (libx264 CPU)\n", res.Name)
 
-	// Map all video filter outputs
-	for i := range qualitiesToEncode {
-		args = append(args, "-map", fmt.Sprintf("[v%dout]", i))
-	}
-
-	// Map audio once for each variant (only if audio exists)
-	if videoHasAudio {
-		for range qualitiesToEncode {
-			args = append(args, "-map", "0:a:0")
-		}
-	}
-
-	// Set codec for each video stream
-	for i := range qualitiesToEncode {
-		codecName := "libx264"
-		if selectedEncoder.IsGPU {
-			codecName = selectedEncoder.Codec
-		}
-		args = append(args, "-c:v:"+fmt.Sprint(i), codecName)
-	}
-
-	// Add encoder-specific settings
-	if selectedEncoder.IsGPU && runtime.GOOS == "windows" {
-		// Windows GPU: just use bitrate (minimal parameters)
-		for i, r := range qualitiesToEncode {
-			args = append(args,
-				"-b:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bitrateMap[r.Name], multiplier),
-			)
-		}
-	} else if selectedEncoder.IsGPU {
-		// Linux GPU: bitrate-based
-		for i, r := range qualitiesToEncode {
-			args = append(args,
-				"-b:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bitrateMap[r.Name], multiplier),
-			)
-		}
-	} else {
-		// CPU encoding
-		for i, r := range qualitiesToEncode {
-			args = append(args,
-				"-preset:v:"+fmt.Sprint(i), "veryfast",
-				"-crf:v:"+fmt.Sprint(i), "20",
-				"-b:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bitrateMap[r.Name], multiplier),
-				"-maxrate:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(maxrateMap[r.Name], multiplier),
-				"-bufsize:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bufsizeMap[r.Name], multiplier),
-				"-g:v:"+fmt.Sprint(i), "48",
-				"-keyint_min:v:"+fmt.Sprint(i), "48",
-				"-sc_threshold:v:"+fmt.Sprint(i), "0",
-			)
-		}
-	}
-
-	// Only add audio encoding if audio exists
-	if videoHasAudio {
-		args = append(args,
-			"-c:a", "aac",
-			"-ac", "2",
-			"-b:a", "256k",
-		)
-	}
-
-	args = append(args,
-		"-f", "hls",
-		"-hls_flags", "independent_segments",
-		"-hls_time", "6",
-		"-hls_list_size", "0",
-	)
-
-	var vsm string
-	for i, r := range qualitiesToEncode {
-		vsm += fmt.Sprintf("v:%d", i)
-		if videoHasAudio {
-			vsm += fmt.Sprintf(",a:%d", i)
-		}
-		vsm += fmt.Sprintf(",name:%s ", r.Name)
-	}
-
-	args = append(args,
-		"-var_stream_map", vsm,
-		"-hls_segment_filename", filepath.Join(outputDir, "%v/segment_%03d.ts"),
-		filepath.Join(outputDir, "%v/playlist.m3u8"),
-	)
-
-	encoderMsg := "libx264 (CPU)"
-	if selectedEncoder.IsGPU {
-		encoderMsg = fmt.Sprintf("%s (GPU)", selectedEncoder.Name)
-	}
-	fmt.Printf("Encoding remaining %d qualities with: %s\n", len(qualitiesToEncode), encoderMsg)
-
-	cmd := exec.Command("ffmpeg", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	err := cmd.Start()
-	if err != nil {
-		return err
-	}
-
-	// Wait for encoding to complete
-	err = cmd.Wait()
-	
-	// If GPU encoding failed and we tried GPU, retry with CPU
-	if err != nil && selectedEncoder.IsGPU {
-		fmt.Printf("GPU encoding failed for remaining qualities, retrying with CPU (libx264)...\n")
-		
-		// CPU fallback: simple format conversion
-		cpuFilter := "[0:v]format=yuv420p,split=" + fmt.Sprint(len(qualitiesToEncode))
-		
-		// Rebuild args with CPU encoder AND proper filter
-		cpuArgs := []string{
-			"-thread_queue_size", "16",  // Reduce thread queue size
-			"-i", inputPath,
-			"-filter_complex", cpuFilter,
-		}
-
-		// Map all video filter outputs
-		for i := range qualitiesToEncode {
-			cpuArgs = append(cpuArgs, "-map", fmt.Sprintf("[v%dout]", i))
-		}
-
-		// Map audio
-		if videoHasAudio {
-			for range qualitiesToEncode {
-				cpuArgs = append(cpuArgs, "-map", "0:a:0")
+			qualityDir := filepath.Join(outputDir, res.Name)
+			if err := os.MkdirAll(qualityDir, 0755); err != nil {
+				fmt.Printf("Failed to create quality dir %s: %v\n", qualityDir, err)
+				errors[index] = err
+				return
 			}
-		}
 
-		// Add CPU encoding settings for all qualities
-		for i, r := range qualitiesToEncode {
-			cpuArgs = append(cpuArgs,
-				"-c:v:"+fmt.Sprint(i), "libx264",
-				"-preset:v:"+fmt.Sprint(i), "veryfast",
-				"-crf:v:"+fmt.Sprint(i), "20",
-				"-b:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bitrateMap[r.Name], multiplier),
-				"-maxrate:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(maxrateMap[r.Name], multiplier),
-				"-bufsize:v:"+fmt.Sprint(i), transcoder.ApplyMultiplierToBitrate(bufsizeMap[r.Name], multiplier),
-				"-g:v:"+fmt.Sprint(i), "48",
-				"-keyint_min:v:"+fmt.Sprint(i), "48",
-				"-sc_threshold:v:"+fmt.Sprint(i), "0",
+			// Build filter for single quality
+			var filter string
+			if isHDR {
+				// For HDR, skip colorspace conversion
+				filter = fmt.Sprintf("[0:v]scale=-2:%d[scaled]", res.H)
+			} else {
+				filter = fmt.Sprintf("[0:v]format=yuv420p,scale=-2:%d[scaled]", res.H)
+			}
+
+			args := []string{
+				"-i", inputPath,
+				"-filter_complex", filter,
+				"-map", "[scaled]",
+			}
+
+			// Map audio
+			if hasAudio(inputPath) {
+				args = append(args, "-map", "0:a:0")
+			}
+
+			// Use libx264 for all background qualities
+			args = append(args,
+				"-c:v", "libx264",
+				"-preset", "fast",
+				"-crf", "20",
+				"-b:v", transcoder.ApplyMultiplierToBitrate(bitrateMap[res.Name], multiplier),
+				"-maxrate", transcoder.ApplyMultiplierToBitrate(maxrateMap[res.Name], multiplier),
+				"-bufsize", transcoder.ApplyMultiplierToBitrate(bufsizeMap[res.Name], multiplier),
+				"-g", "48",
+				"-keyint_min", "48",
+				"-sc_threshold", "0",
 			)
-		}
 
-		// Add audio encoding
-		if videoHasAudio {
-			cpuArgs = append(cpuArgs,
-				"-c:a", "aac",
-				"-ac", "2",
-				"-b:a", "256k",
+			// Audio codec
+			if hasAudio(inputPath) {
+				args = append(args,
+					"-c:a", "aac",
+					"-ac", "2",
+					"-b:a", "256k",
+				)
+			}
+
+			// HLS output
+			args = append(args,
+				"-f", "hls",
+				"-hls_flags", "independent_segments",
+				"-hls_time", "6",
+				"-hls_list_size", "0",
+				"-hls_segment_filename", filepath.Join(qualityDir, "segment_%03d.ts"),
+				filepath.Join(qualityDir, "playlist.m3u8"),
 			)
-		}
 
-		cpuArgs = append(cpuArgs,
-			"-f", "hls",
-			"-hls_flags", "independent_segments",
-			"-hls_time", "6",
-			"-hls_list_size", "0",
-			"-var_stream_map", vsm,
-			"-hls_segment_filename", filepath.Join(outputDir, "%v/segment_%03d.ts"),
-			filepath.Join(outputDir, "%v/playlist.m3u8"),
-		)
+			cmd := exec.Command("ffmpeg", args...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
 
-		cmd = exec.Command("ffmpeg", cpuArgs...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Start()
+			err := cmd.Run()
+			if err != nil {
+				fmt.Printf("Failed to encode %s: %v\n", res.Name, err)
+				errors[index] = err
+				return
+			}
+
+			fmt.Printf("Successfully encoded: %s\n", res.Name)
+		}(idx, resolution)
+	}
+
+	wg.Wait()
+
+	// Check for any encoding errors
+	for i, err := range errors {
 		if err != nil {
-			return err
+			fmt.Printf("Quality encoding failed: %s\n", qualitiesToEncode[i].Name)
 		}
-		err = cmd.Wait()
 	}
 
-	if err != nil {
-		fmt.Printf("Error encoding remaining qualities for %s: %v\n", videoID, err)
-		return err
-	}
-
-	// Regenerate master.m3u8 with all variants (including caption track if available)
-	err = generateMasterPlaylist(outputDir, selected, hasCaptions)
-	if err != nil {
-		fmt.Printf("Error generating master playlist for %s: %v\n", videoID, err)
-		return err
-	}
-
-	fmt.Printf("Finished encoding all qualities for: %s\n", videoID)
-	return nil
+	// After all sequential encoding, regenerate master playlist
+	return generateMasterPlaylist(outputDir, selected, hasCaptions)
 }
 
 func transcodeWithProgress(inputPath, videoID string, database *sql.DB) (int, error) {
@@ -1080,25 +972,44 @@ func main() {
 			fmt.Println("Progress update error (0%):", err)
 		}
 
-		thumbURL := "/videos/" + job.VideoID + "/thumbnail.jpg"
-		
-		// 2. generate thumbnail (10% progress)
-		outputPath := filepath.Join(getOutputDir(), job.VideoID)
-		err = transcoder.GenerateThumbnail(job.FilePath, job.VideoID, outputPath)
+		// Check if custom thumbnail already exists
+		var hasCustomThumbnail bool
+		var existingThumbnailURL string
+		err = database.QueryRow(
+			"SELECT has_custom_thumbnail, thumbnail_url FROM videos WHERE id = $1",
+			job.VideoID,
+		).Scan(&hasCustomThumbnail, &existingThumbnailURL)
 		if err != nil {
-			fmt.Println("Thumbnail error:", err)
-			db.UpdateVideoStatus(database, job.VideoID, "failed")
-			db.UpdateVideoProgress(database, job.VideoID, 0)
-			_, err = database.Exec(
-				`UPDATE videos 
-				SET thumbnail_url=$1 
-				WHERE id=$2`,
-				thumbURL,
-				job.VideoID,
-			)
-			cleanup(job.FilePath)
-			continue
+			fmt.Println("Error checking custom thumbnail:", err)
 		}
+
+		var thumbURL string
+		// Only generate thumbnail if no custom thumbnail exists
+		if !hasCustomThumbnail {
+			thumbURL = "/videos/" + job.VideoID + "/thumbnail.jpg"
+			
+			// 2. generate thumbnail (10% progress)
+			outputPath := filepath.Join(getOutputDir(), job.VideoID)
+			err = transcoder.GenerateThumbnail(job.FilePath, job.VideoID, outputPath)
+			if err != nil {
+				fmt.Println("Thumbnail error:", err)
+				db.UpdateVideoStatus(database, job.VideoID, "failed")
+				db.UpdateVideoProgress(database, job.VideoID, 0)
+				_, err = database.Exec(
+					`UPDATE videos 
+					SET thumbnail_url=$1 
+					WHERE id=$2`,
+					thumbURL,
+					job.VideoID,
+				)
+				cleanup(job.FilePath)
+				continue
+			}
+		} else {
+			thumbURL = existingThumbnailURL
+			fmt.Println("Using custom thumbnail for", job.VideoID)
+		}
+		
 		err = db.UpdateVideoProgress(database, job.VideoID, 10)
 		if err != nil {
 			fmt.Println("Progress update error (10%):", err)

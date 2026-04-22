@@ -21,11 +21,13 @@ func (s *Server) login(c *gin.Context) {
 
 	var hashedPassword string
 	var userID string
+	var userType string
+	var status string
 
 	err := s.db.QueryRow(
-		"SELECT id, password FROM users WHERE LOWER(email)=$1",
+		"SELECT id, password, user_type, COALESCE(status, 'active') FROM users WHERE LOWER(email)=$1",
 		strings.ToLower(body.Email),
-	).Scan(&userID, &hashedPassword)
+	).Scan(&userID, &hashedPassword, &userType, &status)
 
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
@@ -38,8 +40,16 @@ func (s *Server) login(c *gin.Context) {
 		return
 	}
 
+	// Reject login if user is banned
+	if status == "banned" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "account banned", "status": "banned"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"message": "login successful",
-		"user_id": userID,
+		"message":   "login successful",
+		"user_id":   userID,
+		"user_type": userType,
+		"status":    status,
 	})
 }

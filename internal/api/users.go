@@ -35,12 +35,13 @@ func (s *Server) createUser(c *gin.Context) {
 		Username:  body.Username,
 		Email:     strings.ToLower(body.Email),
 		Password:  string(hashedPassword),
+		UserType:  "user",
 		CreatedAt: time.Now().UTC(),
 	}
 
 	_, err = s.db.Exec(
-		"INSERT INTO users (id, username, email, password, created_at) VALUES ($1,$2,$3,$4,$5)",
-		user.ID, user.Username, user.Email, user.Password, user.CreatedAt,
+		"INSERT INTO users (id, username, email, password, user_type, created_at) VALUES ($1,$2,$3,$4,$5,$6)",
+		user.ID, user.Username, user.Email, user.Password, user.UserType, user.CreatedAt,
 	)
 
 	if err != nil {
@@ -52,4 +53,20 @@ func (s *Server) createUser(c *gin.Context) {
 	user.Password = ""
 
 	c.JSON(http.StatusCreated, user)
+}
+func (s *Server) getUser(c *gin.Context) {
+	userID := c.Param("user_id")
+	
+	var user models.User
+	err := s.db.QueryRow(
+		"SELECT id, username, email, user_type, COALESCE(status, 'active'), created_at FROM users WHERE id = $1",
+		userID,
+	).Scan(&user.ID, &user.Username, &user.Email, &user.UserType, &user.Status, &user.CreatedAt)
+	
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, user)
 }

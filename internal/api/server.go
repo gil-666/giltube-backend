@@ -102,13 +102,50 @@ func (s *Server) setupRoutes() {
 		api.PUT("/videos/:id", s.updateVideo)
 		api.DELETE("/videos/:id", s.deleteVideo)
 		api.POST("/users", s.createUser)
+		api.GET("/user/:user_id", s.getUser)
 		api.GET("/users/:user_id/channels", s.listUserChannels)
 		api.POST("/channels", s.createChannel)
 		api.GET("/channels/:channel_id/info", s.getChannelInfo)
 		api.GET("/channels/:channel_id/videos", s.getChannelVideos)
 		api.PUT("/channels/:channel_id", s.updateChannel)
 		api.DELETE("/channels/:channel_id", s.deleteChannel)
-		api.POST("/login", s.login) 
+		api.POST("/login", s.login)
 
+		// Admin routes
+		admin := api.Group("/admin")
+		admin.Use(s.authMiddleware(), s.isAdmin)
+		{
+			admin.GET("/stats", s.getAdminStats)
+			admin.GET("/users", s.getAdminUsers)
+			admin.POST("/users/:id/toggle-admin", s.toggleAdminStatus)
+			admin.DELETE("/users/:id", s.deleteUser)
+			admin.POST("/users/:id/suspend", s.suspendUser)
+			admin.POST("/users/:id/ban", s.banUser)
+			admin.POST("/users/:id/unban", s.unbanUser)
+			admin.POST("/users/:id/unsuspend", s.unsuspendUser)
+			admin.GET("/channels", s.getAdminChannels)
+			admin.POST("/channels/:id/suspend", s.suspendChannel)
+			admin.POST("/channels/:id/ban", s.banChannel)
+			admin.POST("/channels/:id/unban", s.unbanChannel)
+			admin.POST("/channels/:id/unsuspend", s.unsuspendChannel)
+			admin.PUT("/videos/:id/verify", s.verifyVideo)
+		}
+	}
+}
+
+// Middleware to authenticate user from token
+func (s *Server) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Try to get user_id from header or query param
+		userID := c.GetHeader("X-User-ID")
+		if userID == "" {
+			userID = c.Query("user_id")
+		}
+
+		if userID != "" {
+			c.Set("user_id", userID)
+		}
+
+		c.Next()
 	}
 }

@@ -29,6 +29,7 @@ type Video struct {
 	ChannelID string `json:"channel_id"`
 	Width        int       `json:"width"`
 	Categories   []Category `json:"categories"`
+	Hidden       bool      `json:"hidden"`
 }
 
 type Stream struct {
@@ -43,6 +44,8 @@ type User struct {
 	Username  string    `json:"username"`
 	Password  string `json:"-" db:"password"`
 	Email     string    `json:"email"`
+	UserType  string    `json:"user_type"` // "admin" or "user"
+	Status    string    `json:"status"` // "active", "suspended", "banned"
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -54,6 +57,7 @@ type Channel struct {
 	CreatedAt   time.Time      `json:"created_at"`
 	AvatarURL   sql.NullString `json:"avatar_url"`
 	Verified    bool           `json:"verified"`
+	Status      string         `json:"status"` // "active", "suspended", "banned"
 }
 
 type Comment struct {

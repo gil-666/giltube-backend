@@ -157,7 +157,7 @@ func (s *Server) listVideos(c *gin.Context) {
 			COALESCE(c.verified, false)
 		FROM videos v
 		LEFT JOIN channels c ON v.channel_id = c.id
-		WHERE v.status = 'ready'
+		WHERE v.status = 'ready' AND (v.hidden IS NULL OR v.hidden = false)
 		ORDER BY v.created_at DESC
 		LIMIT $1 OFFSET $2
 	`, limit, offset)
@@ -1090,6 +1090,37 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 	}
 	if channelID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id/channelId is required"})
+		return
+	}
+
+	// Check channel status - reject if suspended or banned
+	var channelStatus string
+	err := s.db.QueryRow("SELECT COALESCE(status, 'active') FROM channels WHERE id = $1", channelID).Scan(&channelStatus)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
+		return
+	}
+	if channelStatus != "active" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "channel is " + channelStatus + " and cannot upload videos"})
+		return
+	}
+
+	// Check user status - allow upload if active or suspended, reject if banned
+	var userID string
+	err = s.db.QueryRow("SELECT user_id FROM channels WHERE id = $1", channelID).Scan(&userID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "channel owner not found"})
+		return
+	}
+
+	var userStatus string
+	err = s.db.QueryRow("SELECT COALESCE(status, 'active') FROM users WHERE id = $1", userID).Scan(&userStatus)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	if userStatus == "banned" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "user account is banned and cannot upload videos"})
 		return
 	}
 
