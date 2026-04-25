@@ -7,9 +7,12 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"github.com/gin-gonic/gin"
 	"github.com/gil/giltube/config"
 	"github.com/gil/giltube/internal/queue"
+	"github.com/go-webauthn/webauthn/webauthn"
 )
 
 type Server struct {
@@ -17,6 +20,9 @@ type Server struct {
 	cfg    *config.Config
 	db     *sql.DB
 	queue  *queue.Queue
+	webauthn *webauthn.WebAuthn
+	passkeySessions map[string]passkeySessionState
+	passkeySessionsMu sync.RWMutex
 }
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -38,9 +44,35 @@ func CORSMiddleware() gin.HandlerFunc {
 func NewServer(cfg *config.Config) *Server {
 	// gin.SetMode(gin.ReleaseMode)
 	database := db.Connect(cfg.DatabaseURL)
-	s := &Server{cfg: cfg, db: database}
+	s := &Server{cfg: cfg, db: database, passkeySessions: make(map[string]passkeySessionState)}
 	s.router = gin.Default()
 	s.queue = queue.New(cfg.RedisURL)
+
+	origins := strings.Split(cfg.WebAuthnRPOrigins, ",")
+	trimmedOrigins := make([]string, 0, len(origins))
+	for _, origin := range origins {
+		candidate := strings.TrimSpace(origin)
+		if candidate != "" {
+			trimmedOrigins = append(trimmedOrigins, candidate)
+		}
+	}
+	if len(trimmedOrigins) == 0 {
+		trimmedOrigins = []string{"http://localhost:3000"}
+	}
+
+	wa, err := webauthn.New(&webauthn.Config{
+		RPDisplayName: cfg.WebAuthnRPDisplayName,
+		RPID:          cfg.WebAuthnRPID,
+		RPOrigins:     trimmedOrigins,
+	})
+	if err != nil {
+		panic(err)
+	}
+	s.webauthn = wa
+
+	if err := s.ensurePasskeyTable(); err != nil {
+		panic(err)
+	}
 	
 	// Allow large file uploads - buffer up to 1GB before spilling to disk
 	s.router.MaxMultipartMemory = 1 << 30 // 1GB
@@ -110,6 +142,16 @@ func (s *Server) setupRoutes() {
 		api.PUT("/channels/:channel_id", s.updateChannel)
 		api.DELETE("/channels/:channel_id", s.deleteChannel)
 		api.POST("/login", s.login)
+		api.GET("/account/me", s.authMiddleware(), s.getMyAccount)
+		api.PUT("/account/email", s.authMiddleware(), s.updateMyEmail)
+		api.PUT("/account/password", s.authMiddleware(), s.updateMyPassword)
+		api.DELETE("/account", s.authMiddleware(), s.deleteMyAccount)
+		api.GET("/passkeys", s.authMiddleware(), s.listMyPasskeys)
+		api.POST("/passkeys/register/begin", s.authMiddleware(), s.beginPasskeyRegistration)
+		api.POST("/passkeys/register/finish", s.authMiddleware(), s.finishPasskeyRegistration)
+		api.POST("/passkeys/login/begin", s.beginPasskeyLogin)
+		api.POST("/passkeys/login/finish", s.finishPasskeyLogin)
+		api.DELETE("/passkeys/:id", s.authMiddleware(), s.deleteMyPasskey)
 
 		// Admin routes
 		admin := api.Group("/admin")

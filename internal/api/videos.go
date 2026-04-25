@@ -1077,6 +1077,21 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 	if len(categoryIDs) == 0 {
 		categoryIDs = c.QueryArray("category_ids[]")
 	}
+	if len(categoryIDs) == 0 {
+		categoryIDsStr := c.PostForm("category_ids")
+		if categoryIDsStr == "" {
+			categoryIDsStr = c.Query("category_ids")
+		}
+		if categoryIDsStr != "" {
+			parts := strings.Split(categoryIDsStr, ",")
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					categoryIDs = append(categoryIDs, trimmed)
+				}
+			}
+		}
+	}
 
 	// Get explicit flag
 	explicitStr := c.PostForm("explicit")

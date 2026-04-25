@@ -11,6 +11,9 @@ type Config struct {
 	MinioSecret string
 	MinioBucket string
 	MediaMTXURL string
+	WebAuthnRPID string
+	WebAuthnRPOrigins string
+	WebAuthnRPDisplayName string
 }
 
 func Load() *Config {
@@ -23,6 +26,9 @@ func Load() *Config {
 		MinioSecret: getEnv("MINIO_SECRET", "giltube123"),
 		MinioBucket: getEnv("MINIO_BUCKET", "giltube"),
 		MediaMTXURL: getEnv("MEDIAMTX_URL", "localhost:8554"),
+		WebAuthnRPID: getEnv("WEBAUTHN_RP_ID", "giltube.gilservers.com"),
+		WebAuthnRPOrigins: getEnv("WEBAUTHN_RP_ORIGINS", "https://giltube.gilservers.com"),
+		WebAuthnRPDisplayName: getEnv("WEBAUTHN_RP_DISPLAY_NAME", "GilTube"),
 	}
 }
 

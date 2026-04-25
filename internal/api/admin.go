@@ -117,44 +117,7 @@ func (s *Server) deleteUser(c *gin.Context) {
 		return
 	}
 
-	// Get user's channels
-	rows, err := s.db.Query("SELECT id FROM channels WHERE user_id = $1", userID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer rows.Close()
-
-	var channelIDs []string
-	for rows.Next() {
-		var channelID string
-		if err := rows.Scan(&channelID); err != nil {
-			continue
-		}
-		channelIDs = append(channelIDs, channelID)
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Delete comments, likes, videos associated with user's channels
-	for _, channelID := range channelIDs {
-		tx.Exec("DELETE FROM likes WHERE channel_id = $1", channelID)
-		tx.Exec("DELETE FROM comments WHERE channel_id = $1", channelID)
-		tx.Exec("DELETE FROM videos WHERE channel_id = $1", channelID)
-	}
-
-	// Delete channels
-	tx.Exec("DELETE FROM channels WHERE user_id = $1", userID)
-
-	// Delete user
-	tx.Exec("DELETE FROM users WHERE id = $1", userID)
-
-	err = tx.Commit()
-	if err != nil {
+	if err := s.scrubAndDeleteUser(userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
