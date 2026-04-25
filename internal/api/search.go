@@ -16,6 +16,7 @@ type SearchResult struct {
 	Title     string      `json:"title"`
 	Name      string      `json:"name,omitempty"`
 	Channel   string      `json:"channel,omitempty"`
+	Description string      `json:"description,omitempty"`
 	ChannelID string      `json:"channel_id,omitempty"`
 	Avatar    string      `json:"avatar,omitempty"`
 	Thumbnail string      `json:"thumbnail,omitempty"`
@@ -78,7 +79,7 @@ func (s *Server) search(c *gin.Context) {
 func (s *Server) searchVideos(query string) ([]SearchResult, error) {
 	searchPattern := "%" + query + "%"
 	rows, err := s.db.Query(`
-		SELECT v.id, v.title, v.views, v.thumbnail_url, c.id, c.name, c.verified
+		SELECT v.id, v.title, v.description, v.views, v.thumbnail_url, c.id, c.name, c.verified
 		FROM videos v
 		JOIN channels c ON v.channel_id = c.id
 		WHERE (v.status = 'ready')
@@ -103,6 +104,7 @@ func (s *Server) searchVideos(query string) ([]SearchResult, error) {
 		if err := rows.Scan(
 			&videoID,
 			&r.Title,
+			&r.Description,
 			&r.Views,
 			&thumbnailFilename,
 			&channelID,
@@ -173,7 +175,7 @@ func (s *Server) searchChannels(query string) ([]SearchResult, error) {
 		}
 
 		r.Title = r.Name // Use name as title for display
-		
+		r.Description = desc.String // Set description if available
 		// Add /avatars/ prefix to avatar filename
 		if r.Avatar != "" {
 			r.Avatar = "/avatars/" + r.Avatar

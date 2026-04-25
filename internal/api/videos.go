@@ -1073,6 +1073,11 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 		description = c.Query("description")
 	}
 
+	categoryIDs := c.PostFormArray("category_ids[]")
+	if len(categoryIDs) == 0 {
+		categoryIDs = c.QueryArray("category_ids[]")
+	}
+
 	// Get explicit flag
 	explicitStr := c.PostForm("explicit")
 	explicit := explicitStr == "true"
@@ -1220,6 +1225,8 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save video record"})
 		return
 	}
+
+	_ = db.AssignCategoriesToVideo(s.db, video.ID, categoryIDs)
 
 	// Queue video for processing
 	err = s.queue.Enqueue(queue.Job{VideoID: video.ID, FilePath: finalPath})
