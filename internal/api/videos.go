@@ -569,6 +569,29 @@ func (s *Server) likeVideo(c *gin.Context) {
 		return
 	}
 
+	var actorUserID string
+	_ = s.db.QueryRow("SELECT user_id FROM channels WHERE id = $1", channelID).Scan(&actorUserID)
+
+	var recipientUserID, videoTitle string
+	if err := s.db.QueryRow(
+		`SELECT ch.user_id, COALESCE(v.title, '')
+		 FROM videos v
+		 JOIN channels ch ON ch.id = v.channel_id
+		 WHERE v.id = $1`,
+		videoID,
+	).Scan(&recipientUserID, &videoTitle); err == nil {
+		_ = s.createNotification(notificationCreateInput{
+			RecipientUserID: recipientUserID,
+			ActorChannelID:  channelID,
+			ActorUserID:     actorUserID,
+			Type:            "like_video",
+			RelatedVideoID:  &videoID,
+			Metadata: map[string]interface{}{
+				"video_title": videoTitle,
+			},
+		})
+	}
+
 	likesCount, _ := db.GetLikesCount(s.db, videoID)
 	c.JSON(http.StatusOK, gin.H{"likes": likesCount, "liked": true})
 }

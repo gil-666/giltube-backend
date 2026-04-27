@@ -73,6 +73,10 @@ func NewServer(cfg *config.Config) *Server {
 	if err := s.ensurePasskeyTable(); err != nil {
 		panic(err)
 	}
+
+	if err := s.ensureLiveStreamsTable(); err != nil {
+		panic(err)
+	}
 	
 	// Allow large file uploads - buffer up to 1GB before spilling to disk
 	s.router.MaxMultipartMemory = 1 << 30 // 1GB
@@ -124,7 +128,20 @@ func (s *Server) setupRoutes() {
 		api.GET("/channels/:channel_id/analytics", s.getChannelAnalytics)
 		api.POST("/videos/:id/comments", s.createComment)
 		api.DELETE("/comments/:comment_id", s.deleteComment)
+		api.POST("/comments/:comment_id/like", s.likeComment)
+		api.DELETE("/comments/:comment_id/like", s.unlikeComment)
+		api.GET("/comments/:comment_id/liked", s.checkIfCommentLiked)
 		api.GET("/videos/:id/stream/*filepath", s.streamVideo)
+		api.GET("/live/active", s.listActiveLiveStreams)
+		api.GET("/live/channels/:channel_id", s.getChannelLiveStatus)
+		api.GET("/live/channels/:channel_id/chat", s.getLiveChatMessages)
+		api.POST("/live/channels/:channel_id/chat", s.authMiddleware(), s.postLiveChatMessage)
+		api.GET("/live/me", s.authMiddleware(), s.getMyLiveStream)
+		api.POST("/live/me/publisher-presence", s.authMiddleware(), s.setMyPublisherPresence)
+		api.PUT("/live/me/settings", s.authMiddleware(), s.updateMyLiveStreamSettings)
+		api.POST("/live/me/key/rotate", s.authMiddleware(), s.rotateMyLiveStreamKey)
+		api.POST("/live/me/start", s.authMiddleware(), s.startMyLiveStream)
+		api.POST("/live/me/stop", s.authMiddleware(), s.stopMyLiveStream)
 		api.GET("/videos/:id/download", s.downloadVideo)
 		api.GET("/videos/:id/download-status", s.getDownloadStatus)
 		api.GET("/downloads/:videoID/:quality", s.serveDownload)
@@ -152,6 +169,18 @@ func (s *Server) setupRoutes() {
 		api.POST("/passkeys/login/begin", s.beginPasskeyLogin)
 		api.POST("/passkeys/login/finish", s.finishPasskeyLogin)
 		api.DELETE("/passkeys/:id", s.authMiddleware(), s.deleteMyPasskey)
+
+		notifications := api.Group("/notifications")
+		notifications.Use(s.authMiddleware())
+		{
+			notifications.GET("", s.listNotifications)
+			notifications.GET("/unread-count", s.getUnreadNotificationCount)
+			notifications.GET("/push/config", s.getPushConfig)
+			notifications.PATCH("/:id/read", s.markNotificationRead)
+			notifications.POST("/read-all", s.markAllNotificationsRead)
+			notifications.POST("/push/subscribe", s.subscribePush)
+			notifications.POST("/push/unsubscribe", s.unsubscribePush)
+		}
 
 		// Admin routes
 		admin := api.Group("/admin")

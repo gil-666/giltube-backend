@@ -39,6 +39,19 @@ type Stream struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type LiveStream struct {
+	ID          string     `json:"id"`
+	ChannelID   string     `json:"channel_id"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	StreamKey   string     `json:"stream_key"`
+	Status      string     `json:"status"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	EndedAt     *time.Time `json:"ended_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
 type User struct {
 	ID        string    `json:"id"`
 	Username  string    `json:"username"`
@@ -84,5 +97,30 @@ type Like struct {
 	VideoID   string    `json:"video_id"`
 	ChannelID string    `json:"channel_id"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type Notification struct {
+	ID               string         `json:"id"`
+	RecipientUserID  string         `json:"recipient_user_id"`
+	ActorChannelID   string         `json:"actor_channel_id"`
+	Type             string         `json:"type"`
+	RelatedVideoID   sql.NullString `json:"related_video_id"`
+	RelatedCommentID sql.NullString `json:"related_comment_id"`
+	IsRead           bool           `json:"is_read"`
+	Metadata         string         `json:"metadata"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+}
+
+type PushSubscription struct {
+	ID              string    `json:"id"`
+	RecipientUserID string    `json:"recipient_user_id"`
+	Endpoint        string    `json:"endpoint"`
+	P256DHKey       string    `json:"p256dh_key"`
+	AuthKey         string    `json:"auth_key"`
+	UserAgent       string    `json:"user_agent"`
+	IsActive        bool      `json:"is_active"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 

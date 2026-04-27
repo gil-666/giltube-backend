@@ -53,6 +53,7 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 			c.id,
 			c.text,
 			c.created_at,
+			c.parent_comment_id,
 			ch.id,
 			ch.name,
 			COALESCE(ch.avatar_url, ''),
@@ -60,43 +61,90 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 		FROM comments c
 		JOIN channels ch ON c.channel_id = ch.id
 		WHERE c.video_id = $1
-		ORDER BY c.created_at DESC
+		ORDER BY c.created_at ASC
 	`, videoID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var comments []map[string]interface{}
+	type commentRow struct {
+		ID              string
+		Text            string
+		CreatedAt       string
+		ParentCommentID sql.NullString
+		ChannelID       string
+		ChannelName     string
+		ChannelAvatar   string
+		ChannelVerified bool
+	}
+
+	var rowsData []commentRow
 	for rows.Next() {
-		var id, text, createdAt, chID, chName, chAvatarURL string
-		var chVerified bool
-		err := rows.Scan(&id, &text, &createdAt, &chID, &chName, &chAvatarURL, &chVerified)
+		var row commentRow
+		err := rows.Scan(
+			&row.ID,
+			&row.Text,
+			&row.CreatedAt,
+			&row.ParentCommentID,
+			&row.ChannelID,
+			&row.ChannelName,
+			&row.ChannelAvatar,
+			&row.ChannelVerified,
+		)
 		if err != nil {
 			continue
 		}
-		comments = append(comments, map[string]interface{}{
-			"id":         id,
-			"text":       text,
-			"created_at": createdAt,
-			"channel": map[string]interface{}{
-				"id":         chID,
-				"name":       chName,
-				"avatar_url": chAvatarURL,
-				"verified":   chVerified,
-			},
-		})
+		rowsData = append(rowsData, row)
 	}
-	return comments, nil
+
+	nodes := make(map[string]map[string]interface{}, len(rowsData))
+	roots := make([]map[string]interface{}, 0)
+
+	for _, row := range rowsData {
+		var parent interface{}
+		if row.ParentCommentID.Valid {
+			parent = row.ParentCommentID.String
+		}
+
+		nodes[row.ID] = map[string]interface{}{
+			"id":                row.ID,
+			"text":              row.Text,
+			"created_at":        row.CreatedAt,
+			"parent_comment_id": parent,
+			"channel": map[string]interface{}{
+				"id":         row.ChannelID,
+				"name":       row.ChannelName,
+				"avatar_url": row.ChannelAvatar,
+				"verified":   row.ChannelVerified,
+			},
+			"replies": []map[string]interface{}{},
+		}
+	}
+
+	for _, row := range rowsData {
+		node := nodes[row.ID]
+		if row.ParentCommentID.Valid {
+			if parent, ok := nodes[row.ParentCommentID.String]; ok {
+				replies := parent["replies"].([]map[string]interface{})
+				parent["replies"] = append(replies, node)
+				continue
+			}
+		}
+		roots = append(roots, node)
+	}
+
+	return roots, nil
 }
 
-func CreateComment(db *sql.DB, commentID, videoID, channelID, text string) error {
+func CreateComment(db *sql.DB, commentID, videoID, channelID, text string, parentCommentID *string) error {
 	_, err := db.Exec(
-		"INSERT INTO comments (id, video_id, channel_id, text, created_at) VALUES ($1, $2, $3, $4, NOW())",
+		"INSERT INTO comments (id, video_id, channel_id, text, parent_comment_id, created_at) VALUES ($1, $2, $3, $4, $5, NOW())",
 		commentID,
 		videoID,
 		channelID,
 		text,
+		parentCommentID,
 	)
 	return err
 }
