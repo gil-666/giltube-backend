@@ -48,10 +48,10 @@ func Load() *Config {
 		WebAuthnRPOrigins: getEnv("WEBAUTHN_RP_ORIGINS", "https://giltube.gilservers.com"),
 		WebAuthnRPDisplayName: getEnv("WEBAUTHN_RP_DISPLAY_NAME", "GilTube"),
 		PushEnabled: getEnvBool("PUSH_ENABLED", true),
-		PushSendEnabled: getEnvBool("PUSH_SEND_ENABLED", false),
-		VAPIDPublicKey: getEnv("VAPID_PUBLIC_KEY", ""),
-		VAPIDPrivateKey: getEnv("VAPID_PRIVATE_KEY", ""),
-		VAPIDSubject: getEnv("VAPID_SUBJECT", "mailto:admin@giltube.local"),
+		PushSendEnabled: getEnvBool("PUSH_SEND_ENABLED", true),
+		VAPIDPublicKey: getEnv("VAPID_PUBLIC_KEY", "BAdLFLEJ6BB5nshG5YUebcAAeHmJKPCCV4_seNdH_Ym8wgvjcgvygspfwmKFDQg4b6qVQK3QuftHEmH-sY7oyZY"),
+		VAPIDPrivateKey: getEnv("VAPID_PRIVATE_KEY", "XQrHwQ0nR47R1S9kX-l4hE12GBZFUVmjy6XkAg1j708"),
+		VAPIDSubject: getEnv("VAPID_SUBJECT", "mailto:giltube-notif@gilservers.com"),
 	}
 }
 

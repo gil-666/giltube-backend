@@ -12,8 +12,9 @@ import (
 
 func (s *Server) getVideoComments(c *gin.Context) {
 	videoID := c.Param("id")
+	actorChannelID := strings.TrimSpace(c.Query("channel_id"))
 
-	comments, err := db.GetComments(s.db, videoID)
+	comments, err := db.GetComments(s.db, videoID, actorChannelID)
 	if err != nil {
 		fmt.Println("DB error getting comments:", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get comments"})

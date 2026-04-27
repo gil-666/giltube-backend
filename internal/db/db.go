@@ -47,7 +47,7 @@ func IncrementVideoViews(db *sql.DB, videoID string) error {
 	return err
 }
 
-func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
+func GetComments(db *sql.DB, videoID string, actorChannelID string) ([]map[string]interface{}, error) {
 	rows, err := db.Query(`
 		SELECT 
 			c.id,
@@ -57,12 +57,26 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 			ch.id,
 			ch.name,
 			COALESCE(ch.avatar_url, ''),
-			COALESCE(ch.verified, false)
+			COALESCE(ch.verified, false),
+			COALESCE(clc.likes_count, 0),
+			CASE
+				WHEN $2 = '' THEN false
+				ELSE EXISTS(
+					SELECT 1
+					FROM comment_likes cl
+					WHERE cl.comment_id = c.id AND cl.channel_id = $2
+				)
+			END AS liked_by_actor
 		FROM comments c
 		JOIN channels ch ON c.channel_id = ch.id
+		LEFT JOIN (
+			SELECT comment_id, COUNT(1)::int AS likes_count
+			FROM comment_likes
+			GROUP BY comment_id
+		) clc ON clc.comment_id = c.id
 		WHERE c.video_id = $1
 		ORDER BY c.created_at ASC
-	`, videoID)
+	`, videoID, actorChannelID)
 	if err != nil {
 		return nil, err
 	}
@@ -77,6 +91,8 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 		ChannelName     string
 		ChannelAvatar   string
 		ChannelVerified bool
+		LikesCount      int
+		LikedByActor    bool
 	}
 
 	var rowsData []commentRow
@@ -91,6 +107,8 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 			&row.ChannelName,
 			&row.ChannelAvatar,
 			&row.ChannelVerified,
+			&row.LikesCount,
+			&row.LikedByActor,
 		)
 		if err != nil {
 			continue
@@ -112,6 +130,8 @@ func GetComments(db *sql.DB, videoID string) ([]map[string]interface{}, error) {
 			"text":              row.Text,
 			"created_at":        row.CreatedAt,
 			"parent_comment_id": parent,
+			"likes_count":       row.LikesCount,
+			"liked_by_actor":    row.LikedByActor,
 			"channel": map[string]interface{}{
 				"id":         row.ChannelID,
 				"name":       row.ChannelName,

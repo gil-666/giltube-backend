@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"time"
+	"log"
 	"github.com/gil/giltube/internal/db"
 	"database/sql"
 	"os"
@@ -76,6 +77,14 @@ func NewServer(cfg *config.Config) *Server {
 
 	if err := s.ensureLiveStreamsTable(); err != nil {
 		panic(err)
+	}
+
+	if s.cfg.PushEnabled {
+		if strings.TrimSpace(s.cfg.VAPIDPublicKey) == "" || strings.TrimSpace(s.cfg.VAPIDPrivateKey) == "" {
+			log.Println("push notifications disabled: missing VAPID_PUBLIC_KEY or VAPID_PRIVATE_KEY")
+			s.cfg.PushEnabled = false
+			s.cfg.PushSendEnabled = false
+		}
 	}
 	
 	// Allow large file uploads - buffer up to 1GB before spilling to disk

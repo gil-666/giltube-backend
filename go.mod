@@ -6,6 +6,7 @@ require (
 	github.com/gin-gonic/gin v1.10.0
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.3
+	github.com/SherClockHolmes/webpush-go v1.4.0
 )
 
 require (

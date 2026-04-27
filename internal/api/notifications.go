@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/SherClockHolmes/webpush-go"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -37,6 +38,13 @@ type pushUnsubscribeRequest struct {
 
 type markNotificationReadRequest struct {
 	IsRead bool `json:"is_read"`
+}
+
+type pushPayload struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
+	URL   string `json:"url"`
+	Type  string `json:"type"`
 }
 
 func (s *Server) listNotifications(c *gin.Context) {
@@ -392,7 +400,14 @@ func (s *Server) createNotification(input notificationCreateInput) error {
 			updated_at
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, false, $7::jsonb, NOW(), NOW())
-		ON CONFLICT ON CONSTRAINT idx_notifications_dedupe_window DO NOTHING`,
+		ON CONFLICT (
+			recipient_user_id,
+			actor_channel_id,
+			type,
+			COALESCE(related_video_id, ''),
+			COALESCE(related_comment_id, ''),
+			minute_bucket
+		) DO NOTHING`,
 		uuid.New().String(),
 		input.RecipientUserID,
 		input.ActorChannelID,
@@ -402,35 +417,122 @@ func (s *Server) createNotification(input notificationCreateInput) error {
 		string(metadataJSON),
 	)
 	if err != nil {
-		// If dedupe constraint name is not available in older postgres versions,
-		// fall back to a plain insert-on-conflict target.
-		_, fallbackErr := s.db.Exec(
-			`INSERT INTO notifications (
-				id,
-				recipient_user_id,
-				actor_channel_id,
-				type,
-				related_video_id,
-				related_comment_id,
-				is_read,
-				metadata,
-				created_at,
-				updated_at
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, false, $7::jsonb, NOW(), NOW())
-			ON CONFLICT DO NOTHING`,
-			uuid.New().String(),
-			input.RecipientUserID,
-			input.ActorChannelID,
-			input.Type,
-			input.RelatedVideoID,
-			input.RelatedCommentID,
-			string(metadataJSON),
-		)
-		if fallbackErr != nil {
-			return fallbackErr
+		return err
+	}
+
+	_ = s.sendNotificationPush(input)
+
+	return nil
+}
+
+func (s *Server) sendNotificationPush(input notificationCreateInput) error {
+	if !s.cfg.PushEnabled || !s.cfg.PushSendEnabled {
+		return nil
+	}
+	if strings.TrimSpace(s.cfg.VAPIDPublicKey) == "" || strings.TrimSpace(s.cfg.VAPIDPrivateKey) == "" {
+		return nil
+	}
+
+	videoID := sql.NullString{}
+	commentID := sql.NullString{}
+	if input.RelatedVideoID != nil {
+		videoID.Valid = true
+		videoID.String = *input.RelatedVideoID
+	}
+	if input.RelatedCommentID != nil {
+		commentID.Valid = true
+		commentID.String = *input.RelatedCommentID
+	}
+
+	var actorName string
+	_ = s.db.QueryRow("SELECT name FROM channels WHERE id = $1", input.ActorChannelID).Scan(&actorName)
+	if strings.TrimSpace(actorName) == "" {
+		actorName = "Someone"
+	}
+
+	payload := pushPayload{
+		Title: "Giltube",
+		Body:  summarizePushBody(input.Type, actorName),
+		URL:   buildNotificationURL(input.Type, videoID, commentID),
+		Type:  input.Type,
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	rows, err := s.db.Query(
+		`SELECT endpoint, p256dh_key, auth_key
+		 FROM push_subscriptions
+		 WHERE recipient_user_id = $1 AND is_active = true`,
+		input.RecipientUserID,
+	)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	options := &webpush.Options{
+		Subscriber:      s.cfg.VAPIDSubject,
+		VAPIDPublicKey:  s.cfg.VAPIDPublicKey,
+		VAPIDPrivateKey: s.cfg.VAPIDPrivateKey,
+		TTL:             30,
+	}
+
+	for rows.Next() {
+		var endpoint, p256dhKey, authKey string
+		if err := rows.Scan(&endpoint, &p256dhKey, &authKey); err != nil {
+			continue
+		}
+
+		subscription := &webpush.Subscription{
+			Endpoint: endpoint,
+			Keys: webpush.Keys{
+				P256dh: p256dhKey,
+				Auth:   authKey,
+			},
+		}
+
+		resp, err := webpush.SendNotification(payloadJSON, subscription, options)
+		if err != nil {
+			if resp != nil {
+				if resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusNotFound {
+					_, _ = s.db.Exec(
+						"UPDATE push_subscriptions SET is_active = false, updated_at = NOW() WHERE endpoint = $1",
+						endpoint,
+					)
+				}
+				_ = resp.Body.Close()
+			}
+			continue
+		}
+
+		if resp != nil {
+			if resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusNotFound {
+				_, _ = s.db.Exec(
+					"UPDATE push_subscriptions SET is_active = false, updated_at = NOW() WHERE endpoint = $1",
+					endpoint,
+				)
+			}
+			_ = resp.Body.Close()
 		}
 	}
 
 	return nil
+}
+
+func summarizePushBody(notificationType, actorName string) string {
+	switch notificationType {
+	case "comment_video":
+		return actorName + " commented on your video"
+	case "reply_comment":
+		return actorName + " replied to your comment"
+	case "like_video":
+		return actorName + " liked your video"
+	case "like_comment":
+		return actorName + " liked your comment"
+	default:
+		return actorName + " sent you a notification"
+	}
 }

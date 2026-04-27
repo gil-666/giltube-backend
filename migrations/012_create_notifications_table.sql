@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     type TEXT NOT NULL CHECK (type IN ('comment_video', 'reply_comment', 'like_video', 'like_comment')),
     related_video_id TEXT NULL REFERENCES videos(id) ON DELETE CASCADE,
     related_comment_id TEXT NULL REFERENCES comments(id) ON DELETE CASCADE,
+    minute_bucket BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW())::bigint / 60),
     is_read BOOLEAN NOT NULL DEFAULT FALSE,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -30,5 +31,5 @@ ON notifications (
     type,
     COALESCE(related_video_id, ''),
     COALESCE(related_comment_id, ''),
-    (date_trunc('minute', created_at))
+    minute_bucket
 );
