@@ -1,0 +1,2 @@
+ALTER TABLE live_streams
+ADD COLUMN IF NOT EXISTS vod_video_id TEXT NULL;

@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,6 +47,8 @@ type pushPayload struct {
 	Body  string `json:"body"`
 	URL   string `json:"url"`
 	Type  string `json:"type"`
+	Icon  string `json:"icon"`
+	Image string `json:"image"`
 }
 
 func (s *Server) listNotifications(c *gin.Context) {
@@ -420,7 +424,9 @@ func (s *Server) createNotification(input notificationCreateInput) error {
 		return err
 	}
 
-	_ = s.sendNotificationPush(input)
+	if err := s.sendNotificationPush(input); err != nil {
+		log.Printf("push dispatch summary recipient=%s type=%s err=%v", input.RecipientUserID, input.Type, err)
+	}
 
 	return nil
 }
@@ -444,17 +450,21 @@ func (s *Server) sendNotificationPush(input notificationCreateInput) error {
 		commentID.String = *input.RelatedCommentID
 	}
 
-	var actorName string
-	_ = s.db.QueryRow("SELECT name FROM channels WHERE id = $1", input.ActorChannelID).Scan(&actorName)
+	var actorName, actorAvatar string
+	_ = s.db.QueryRow("SELECT name, COALESCE(avatar_url, '') FROM channels WHERE id = $1", input.ActorChannelID).Scan(&actorName, &actorAvatar)
 	if strings.TrimSpace(actorName) == "" {
 		actorName = "Someone"
 	}
+	avatarURL := normalizeAvatarURL(actorAvatar)
+	avatarPushURL := s.toAbsolutePublicURL(avatarURL)
 
 	payload := pushPayload{
 		Title: "Giltube",
 		Body:  summarizePushBody(input.Type, actorName),
 		URL:   buildNotificationURL(input.Type, videoID, commentID),
 		Type:  input.Type,
+		Icon:  avatarPushURL,
+		Image: avatarPushURL,
 	}
 
 	payloadJSON, err := json.Marshal(payload)
@@ -480,11 +490,16 @@ func (s *Server) sendNotificationPush(input notificationCreateInput) error {
 		TTL:             30,
 	}
 
+	attempted := 0
+	delivered := 0
+	failed := 0
+
 	for rows.Next() {
 		var endpoint, p256dhKey, authKey string
 		if err := rows.Scan(&endpoint, &p256dhKey, &authKey); err != nil {
 			continue
 		}
+		attempted++
 
 		subscription := &webpush.Subscription{
 			Endpoint: endpoint,
@@ -496,7 +511,14 @@ func (s *Server) sendNotificationPush(input notificationCreateInput) error {
 
 		resp, err := webpush.SendNotification(payloadJSON, subscription, options)
 		if err != nil {
+			failed++
+			log.Printf("push send failed endpoint=%s err=%v", endpoint, err)
 			if resp != nil {
+				respBody := ""
+				if b, readErr := io.ReadAll(resp.Body); readErr == nil {
+					respBody = strings.TrimSpace(string(b))
+				}
+				log.Printf("push send response endpoint=%s status=%d body=%s", endpoint, resp.StatusCode, respBody)
 				if resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusNotFound {
 					_, _ = s.db.Exec(
 						"UPDATE push_subscriptions SET is_active = false, updated_at = NOW() WHERE endpoint = $1",
@@ -509,6 +531,16 @@ func (s *Server) sendNotificationPush(input notificationCreateInput) error {
 		}
 
 		if resp != nil {
+			respBody := ""
+			if b, readErr := io.ReadAll(resp.Body); readErr == nil {
+				respBody = strings.TrimSpace(string(b))
+			}
+			log.Printf("push send response endpoint=%s status=%d body=%s", endpoint, resp.StatusCode, respBody)
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				delivered++
+			} else {
+				failed++
+			}
 			if resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusNotFound {
 				_, _ = s.db.Exec(
 					"UPDATE push_subscriptions SET is_active = false, updated_at = NOW() WHERE endpoint = $1",
@@ -519,7 +551,40 @@ func (s *Server) sendNotificationPush(input notificationCreateInput) error {
 		}
 	}
 
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if attempted == 0 {
+		return fmt.Errorf("no active push subscriptions")
+	}
+	if delivered == 0 {
+		return fmt.Errorf("push delivery failed for all subscriptions (attempted=%d failed=%d)", attempted, failed)
+	}
+
 	return nil
+}
+
+func (s *Server) toAbsolutePublicURL(path string) string {
+	raw := strings.TrimSpace(path)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	origins := strings.Split(s.cfg.WebAuthnRPOrigins, ",")
+	for _, origin := range origins {
+		candidate := strings.TrimSpace(origin)
+		if candidate == "" {
+			continue
+		}
+		return strings.TrimRight(candidate, "/") + raw
+	}
+	return raw
 }
 
 func summarizePushBody(notificationType, actorName string) string {

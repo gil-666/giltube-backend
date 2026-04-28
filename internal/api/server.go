@@ -1,30 +1,35 @@
 package api
 
 import (
-	"net/http"
-	"time"
-	"log"
-	"github.com/gil/giltube/internal/db"
 	"database/sql"
+	"github.com/gil/giltube/config"
+	"github.com/gil/giltube/internal/db"
+	"github.com/gil/giltube/internal/presence"
+	"github.com/gil/giltube/internal/queue"
+	"github.com/gin-gonic/gin"
+	"github.com/go-webauthn/webauthn/webauthn"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"github.com/gin-gonic/gin"
-	"github.com/gil/giltube/config"
-	"github.com/gil/giltube/internal/queue"
-	"github.com/go-webauthn/webauthn/webauthn"
+	"time"
 )
 
 type Server struct {
-	router *gin.Engine
-	cfg    *config.Config
-	db     *sql.DB
-	queue  *queue.Queue
-	webauthn *webauthn.WebAuthn
-	passkeySessions map[string]passkeySessionState
+	router            *gin.Engine
+	cfg               *config.Config
+	db                *sql.DB
+	queue             *queue.Queue
+	presence          *presence.Presence
+	liveStateCache    map[string]liveStateCacheEntry
+	liveStateCacheMu  sync.RWMutex
+	webauthn          *webauthn.WebAuthn
+	passkeySessions   map[string]passkeySessionState
 	passkeySessionsMu sync.RWMutex
 }
+
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
@@ -41,13 +46,18 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
-
 func NewServer(cfg *config.Config) *Server {
 	// gin.SetMode(gin.ReleaseMode)
 	database := db.Connect(cfg.DatabaseURL)
-	s := &Server{cfg: cfg, db: database, passkeySessions: make(map[string]passkeySessionState)}
+	s := &Server{
+		cfg:             cfg,
+		db:              database,
+		liveStateCache:  make(map[string]liveStateCacheEntry),
+		passkeySessions: make(map[string]passkeySessionState),
+	}
 	s.router = gin.Default()
 	s.queue = queue.New(cfg.RedisURL)
+	s.presence = presence.New(cfg.RedisURL)
 
 	origins := strings.Split(cfg.WebAuthnRPOrigins, ",")
 	trimmedOrigins := make([]string, 0, len(origins))
@@ -86,10 +96,10 @@ func NewServer(cfg *config.Config) *Server {
 			s.cfg.PushSendEnabled = false
 		}
 	}
-	
+
 	// Allow large file uploads - buffer up to 1GB before spilling to disk
 	s.router.MaxMultipartMemory = 1 << 30 // 1GB
-	
+
 	s.router.Static("/videos", filepath.Join(os.Getenv("HOME"), "giltube/output"))
 	s.router.Static("/downloads", filepath.Join(os.Getenv("HOME"), "giltube/downloads"))
 	s.router.Static("/avatars", filepath.Join(os.Getenv("HOME"), "giltube/giltube-backend/data/avatars"))
@@ -102,10 +112,10 @@ func (s *Server) Run(addr string) error {
 	srv := &http.Server{
 		Addr:           addr,
 		Handler:        s.router,
-		ReadTimeout:    1 * time.Hour,     // 1 hour for reading entire request (large uploads)
-		WriteTimeout:   1 * time.Hour,     // 1 hour for writing response
-		IdleTimeout:    5 * time.Minute,   // 5 minutes for idle connections
-		MaxHeaderBytes: 1 << 20,           // 1MB max header size
+		ReadTimeout:    1 * time.Hour,   // 1 hour for reading entire request (large uploads)
+		WriteTimeout:   1 * time.Hour,   // 1 hour for writing response
+		IdleTimeout:    5 * time.Minute, // 5 minutes for idle connections
+		MaxHeaderBytes: 1 << 20,         // 1MB max header size
 	}
 	return srv.ListenAndServe()
 }
@@ -117,7 +127,7 @@ func (s *Server) setupRoutes() {
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		})
 
-		// Search 
+		// Search
 		api.GET("/search", s.search)
 
 		// Categories
@@ -142,6 +152,10 @@ func (s *Server) setupRoutes() {
 		api.GET("/comments/:comment_id/liked", s.checkIfCommentLiked)
 		api.GET("/videos/:id/stream/*filepath", s.streamVideo)
 		api.GET("/live/active", s.listActiveLiveStreams)
+		// Presence endpoints for live streams
+		api.POST("/live/:video_id/presence", s.joinPresence)
+		api.DELETE("/live/:video_id/presence", s.leavePresence)
+		api.GET("/live/:video_id/presence/stream", s.presenceStream)
 		api.GET("/live/channels/:channel_id", s.getChannelLiveStatus)
 		api.GET("/live/channels/:channel_id/chat", s.getLiveChatMessages)
 		api.POST("/live/channels/:channel_id/chat", s.authMiddleware(), s.postLiveChatMessage)

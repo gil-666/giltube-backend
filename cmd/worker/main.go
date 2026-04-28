@@ -2,8 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"fmt"
+	"github.com/gil/giltube/config"
+	"github.com/gil/giltube/internal/db"
+	"github.com/gil/giltube/internal/paths"
+	"github.com/gil/giltube/internal/queue"
+	"github.com/gil/giltube/internal/transcoder"
+	"github.com/google/uuid"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,11 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
-	"github.com/gil/giltube/config"
-	"github.com/gil/giltube/internal/queue"
-	"github.com/gil/giltube/internal/transcoder"
-	"github.com/gil/giltube/internal/db"
 )
 
 type Resolution struct {
@@ -24,29 +29,28 @@ type Resolution struct {
 	W    int
 }
 
-func getOutputDir() string {
-	if outputDir := os.Getenv("GILTUBE_OUTPUT_DIR"); outputDir != "" {
-		return outputDir
-	}
-	
-	if runtime.GOOS == "windows" {
-		return "\\\\wsl.localhost\\Ubuntu\\home\\gil\\giltube\\output"
-	}
-	
-	return filepath.Join(os.Getenv("HOME"), "giltube/output")
+type liveRecordingSession struct {
+	streamKey  string
+	outputPath string
+	cancel     context.CancelFunc
+	done       chan error
+	cmdMu      sync.Mutex
+	cmd        *exec.Cmd
 }
+
+var liveRecordingSessions sync.Map
 
 func translatePath(inputPath string) string {
 	if runtime.GOOS != "windows" {
 		return inputPath
 	}
-	
+
 	if strings.HasPrefix(inputPath, "/") {
 		wslPath := strings.TrimPrefix(inputPath, "/")
 		wslPath = strings.ReplaceAll(wslPath, "/", "\\")
 		return "\\\\wsl.localhost\\Ubuntu\\" + wslPath
 	}
-	
+
 	return inputPath
 }
 
@@ -54,7 +58,7 @@ func convertWindowsPathToWSL(inputPath string) string {
 	if runtime.GOOS != "linux" {
 		return inputPath
 	}
-	
+
 	if strings.HasPrefix(inputPath, "\\\\wsl.localhost\\Ubuntu\\") {
 		linuxPath := strings.TrimPrefix(inputPath, "\\\\wsl.localhost\\Ubuntu")
 		linuxPath = strings.ReplaceAll(linuxPath, "\\", "/")
@@ -63,11 +67,11 @@ func convertWindowsPathToWSL(inputPath string) string {
 		}
 		return linuxPath
 	}
-	
+
 	if strings.Contains(inputPath, "\\") && len(inputPath) > 1 && inputPath[1] == ':' {
 		return strings.ReplaceAll(inputPath, "\\", "/")
 	}
-	
+
 	return inputPath
 }
 
@@ -119,33 +123,33 @@ func hasAudio(inputPath string) bool {
 // isQualityEncoded checks if a specific quality variant is already encoded
 func isQualityEncoded(outputDir string, qualityName string) bool {
 	playlistPath := filepath.Join(outputDir, qualityName, "playlist.m3u8")
-	
+
 	// Check if playlist exists
 	if _, err := os.Stat(playlistPath); err != nil {
 		return false
 	}
-	
+
 	// Check if at least one segment exists
 	segmentPattern := filepath.Join(outputDir, qualityName, "segment_*.ts")
 	matches, err := filepath.Glob(segmentPattern)
 	if err != nil || len(matches) == 0 {
 		return false
 	}
-	
+
 	// Check if playlist has #EXT-X-ENDLIST (indicates encoding completed)
 	file, err := os.Open(playlistPath)
 	if err != nil {
 		return false
 	}
 	defer file.Close()
-	
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		if scanner.Text() == "#EXT-X-ENDLIST" {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -158,7 +162,7 @@ type EncoderType struct {
 func detectGPUEncoder() *EncoderType {
 	// Check for AMD GPU encoders
 	var encoders []string
-	
+
 	if runtime.GOOS == "windows" {
 		// Windows: try h264_amf first (better browser compatibility than hevc_amf)
 		encoders = []string{"h264_amf", "hevc_amf"}
@@ -166,7 +170,7 @@ func detectGPUEncoder() *EncoderType {
 		// Linux: try ROCM encoders
 		encoders = []string{"hevc_rocm", "h264_rocm", "hevc_amf", "h264_amf"}
 	}
-	
+
 	for _, encoder := range encoders {
 		cmd := exec.Command("ffmpeg", "-encoders", "-hide_banner")
 		out, err := cmd.CombinedOutput()
@@ -175,7 +179,7 @@ func detectGPUEncoder() *EncoderType {
 			return &EncoderType{Name: encoder, Codec: encoder, IsGPU: true}
 		}
 	}
-	
+
 	fmt.Printf("GPU encoder not found, using CPU (libx264)\n")
 	return &EncoderType{Name: "libx264", Codec: "libx264", IsGPU: false}
 }
@@ -198,7 +202,7 @@ func getEncoderArgs(encoder *EncoderType, bitrate, maxrate, bufsize string) []st
 			"-maxrate:v", maxrate,
 			"-bufsize:v", bufsize,
 		}
-		
+
 		return args
 	} else {
 		// CPU encoding (libx264)
@@ -218,17 +222,17 @@ func tryEncodeWithFallback(args []string, isGPUFirstAttempt bool) error {
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	err := cmd.Run()
-	
+
 	// If GPU encoding failed and this was a GPU attempt, retry with CPU
 	if err != nil && isGPUFirstAttempt && selectedEncoder.IsGPU {
 		fmt.Println("GPU encoding failed, falling back to CPU encoding (libx264)...")
-		
+
 		// Replace GPU codec with CPU codec in arguments
 		newArgs := make([]string, len(args))
 		copy(newArgs, args)
-		
+
 		for i, arg := range newArgs {
 			if arg == selectedEncoder.Codec {
 				newArgs[i] = "libx264"
@@ -248,18 +252,18 @@ func tryEncodeWithFallback(args []string, isGPUFirstAttempt bool) error {
 				break
 			}
 		}
-		
+
 		// Retry with CPU
 		cmd = exec.Command("ffmpeg", newArgs...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		err = cmd.Run()
-		
+
 		if err == nil {
 			fmt.Println("CPU encoding succeeded as fallback")
 		}
 	}
-	
+
 	return err
 }
 
@@ -272,6 +276,280 @@ func cleanup(path string) {
 	}
 }
 
+func liveRecordingsDir() string {
+	if dir := strings.TrimSpace(os.Getenv("GILTUBE_LIVE_RECORDINGS_DIR")); dir != "" {
+		return dir
+	}
+	return filepath.Join(paths.OutputDir(), "live-recordings")
+}
+
+func publicOutputPath(absPath string) (string, error) {
+	relPath, err := filepath.Rel(paths.OutputDir(), absPath)
+	if err != nil {
+		return "", err
+	}
+	relPath = filepath.ToSlash(relPath)
+	if strings.HasPrefix(relPath, "../") || relPath == ".." {
+		return "", fmt.Errorf("path %q is outside output dir", absPath)
+	}
+	return "/videos/" + relPath, nil
+}
+
+func copyFile(srcPath, dstPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+
+	info, err := src.Stat()
+	if err == nil {
+		_ = os.Chmod(dstPath, info.Mode())
+	}
+
+	return dst.Close()
+}
+
+func liveLocalIngestURL(cfg *config.Config) string {
+	base := strings.TrimSpace(cfg.MediaMTXLocalRTMPURL)
+	if base == "" {
+		base = cfg.MediaMTXRTMPURL
+	}
+	return strings.TrimRight(base, "/") + "/live"
+}
+
+func liveRecordingOutputPath(streamKey string) string {
+	return filepath.Join(liveRecordingsDir(), streamKey+".mp4")
+}
+
+func runLiveRecordingLoop(ctx context.Context, cfg *config.Config, session *liveRecordingSession) {
+	defer close(session.done)
+
+	inputURL := liveLocalIngestURL(cfg) + "/" + session.streamKey
+
+	for {
+		if ctx.Err() != nil {
+			session.done <- ctx.Err()
+			return
+		}
+
+		_ = os.Remove(session.outputPath)
+		cmd := exec.Command(
+			"ffmpeg",
+			"-y",
+			"-hide_banner",
+			"-loglevel", "error",
+			"-i", inputURL,
+			"-c", "copy",
+			"-movflags", "+faststart",
+			session.outputPath,
+		)
+
+		session.cmdMu.Lock()
+		session.cmd = cmd
+		session.cmdMu.Unlock()
+
+		err := cmd.Run()
+
+		session.cmdMu.Lock()
+		session.cmd = nil
+		session.cmdMu.Unlock()
+
+		if ctx.Err() != nil {
+			session.done <- ctx.Err()
+			return
+		}
+
+		if err == nil {
+			if info, statErr := os.Stat(session.outputPath); statErr == nil && info.Size() > 0 {
+				session.done <- nil
+				return
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			session.done <- ctx.Err()
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func startLiveRecording(cfg *config.Config, streamKey string) error {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return fmt.Errorf("stream key is required")
+	}
+
+	if err := os.MkdirAll(liveRecordingsDir(), 0755); err != nil {
+		return err
+	}
+
+	if _, exists := liveRecordingSessions.Load(streamKey); exists {
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &liveRecordingSession{
+		streamKey:  streamKey,
+		outputPath: liveRecordingOutputPath(streamKey),
+		cancel:     cancel,
+		done:       make(chan error, 1),
+	}
+	liveRecordingSessions.Store(streamKey, session)
+	go runLiveRecordingLoop(ctx, cfg, session)
+	return nil
+}
+
+func stopLiveRecording(streamKey string) (string, error) {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return "", fmt.Errorf("stream key is required")
+	}
+
+	value, exists := liveRecordingSessions.LoadAndDelete(streamKey)
+	if exists {
+		session := value.(*liveRecordingSession)
+		session.cancel()
+		session.cmdMu.Lock()
+		if session.cmd != nil && session.cmd.Process != nil {
+			_ = session.cmd.Process.Signal(syscall.SIGINT)
+		}
+		session.cmdMu.Unlock()
+
+		select {
+		case <-session.done:
+		case <-time.After(10 * time.Second):
+			return session.outputPath, fmt.Errorf("timed out while stopping live recorder")
+		}
+	}
+
+	recordingPath := liveRecordingOutputPath(streamKey)
+	info, err := os.Stat(recordingPath)
+	if err != nil {
+		return recordingPath, err
+	}
+	if info.Size() == 0 {
+		return recordingPath, fmt.Errorf("live recording is empty")
+	}
+
+	return recordingPath, nil
+}
+
+func archiveCompletedLiveStreamRecording(database *sql.DB, recordingPath string, job *queue.LiveRecordingJob) error {
+	var existingVODVideoID sql.NullString
+	err := database.QueryRow(
+		"SELECT vod_video_id FROM live_streams WHERE id = $1",
+		job.LiveStreamID,
+	).Scan(&existingVODVideoID)
+	if err != nil {
+		return err
+	}
+	if existingVODVideoID.Valid && strings.TrimSpace(existingVODVideoID.String) != "" {
+		cleanup(recordingPath)
+		return nil
+	}
+
+	videoID := uuid.New().String()
+	videoDir := paths.VideoDir(videoID)
+	destDir := filepath.Join(videoDir, "source")
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return err
+	}
+
+	ext := strings.ToLower(filepath.Ext(recordingPath))
+	if ext == "" {
+		ext = ".mp4"
+	}
+	destPath := filepath.Join(destDir, "original"+ext)
+	if err := copyFile(recordingPath, destPath); err != nil {
+		return err
+	}
+	cleanup(recordingPath)
+
+	publicPath, err := publicOutputPath(destPath)
+	if err != nil {
+		return err
+	}
+
+	title := strings.TrimSpace(job.Title)
+	if title == "" {
+		title = "Live Stream"
+	}
+
+	thumbnailURL := ""
+	if err := transcoder.GenerateThumbnail(destPath, videoID, videoDir); err != nil {
+		fmt.Printf("thumbnail generation failed for live VOD %s: %v\n", videoID, err)
+	} else {
+		thumbnailURL = fmt.Sprintf("/videos/%s/thumbnail.jpg", videoID)
+	}
+
+	_, err = database.Exec(`
+		INSERT INTO videos (
+			id, title, description, status, created_at, channel_id, hls_path, thumbnail_url, has_custom_thumbnail
+		) VALUES ($1, $2, $3, 'ready', NOW(), $4, $5, $6, false)
+	`, videoID, title, job.Description, job.ChannelID, publicPath, thumbnailURL)
+	if err != nil {
+		return err
+	}
+
+	_, err = database.Exec(`
+		UPDATE live_streams
+		SET vod_video_id = $1, updated_at = NOW()
+		WHERE id = $2
+	`, videoID, job.LiveStreamID)
+	return err
+}
+
+func processLiveRecordingJob(cfg *config.Config, database *sql.DB, job *queue.LiveRecordingJob) {
+	switch strings.TrimSpace(job.Action) {
+	case "start":
+		if err := startLiveRecording(cfg, job.StreamKey); err != nil {
+			fmt.Printf("live recording start failed for %s: %v\n", job.StreamKey, err)
+		}
+	case "cancel":
+		recordingPath, err := stopLiveRecording(job.StreamKey)
+		if err != nil && !os.IsNotExist(err) {
+			fmt.Printf("live recording cancel failed for %s: %v\n", job.StreamKey, err)
+		}
+		if recordingPath != "" {
+			cleanup(recordingPath)
+		}
+	case "stop":
+		var existingVODVideoID sql.NullString
+		if err := database.QueryRow(
+			"SELECT vod_video_id FROM live_streams WHERE channel_id = $1",
+			job.ChannelID,
+		).Scan(&existingVODVideoID); err == nil {
+			if existingVODVideoID.Valid && strings.TrimSpace(existingVODVideoID.String) != "" {
+				fmt.Printf("live recording stop skipped for channel %s: VOD already exists\n", job.ChannelID)
+				return
+			}
+		}
+		recordingPath, err := stopLiveRecording(job.StreamKey)
+		if err != nil {
+			fmt.Printf("live recording stop failed for %s: %v\n", job.StreamKey, err)
+			return
+		}
+		if err := archiveCompletedLiveStreamRecording(database, recordingPath, job); err != nil {
+			fmt.Printf("live stream archive failed for channel %s: %v\n", job.ChannelID, err)
+		}
+	default:
+		fmt.Printf("unknown live recording action: %s\n", job.Action)
+	}
+}
+
 func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, selected []Resolution, totalFrames int, multiplier float64, outputDir string, hasCaptions bool, bitDepth int, isHDR bool) error {
 	// Encode only the highest quality variant (first in selected array)
 	if len(selected) == 0 {
@@ -280,13 +558,13 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 
 	highestQuality := selected[0]
 	fmt.Printf("Encoding highest quality first: %s (bit depth: %d)\n", highestQuality.Name, bitDepth)
-	
+
 	// Check if highest quality is already encoded (for resume capability)
 	if isQualityEncoded(outputDir, highestQuality.Name) {
 		fmt.Printf("Highest quality %s already encoded, skipping to remaining qualities\n", highestQuality.Name)
 		return nil
 	}
-	
+
 	// Check if video has audio
 	videoHasAudio := hasAudio(inputPath)
 	fmt.Printf("Video has audio: %v\n", videoHasAudio)
@@ -326,12 +604,12 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 	filter := fmt.Sprintf("[0:v]format=yuv420p,scale=-2:%d[vout]", highestQuality.H)
 
 	args := []string{
-		"-thread_queue_size", "16",  // Reduce thread queue size to avoid excessive buffering
+		"-thread_queue_size", "16", // Reduce thread queue size to avoid excessive buffering
 		"-i", inputPath,
 		"-filter_complex", filter,
 		"-map", "[vout]",
 	}
-	
+
 	// Only map audio if it exists
 	if videoHasAudio {
 		args = append(args, "-map", "0:a:0")
@@ -343,9 +621,9 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 		transcoder.ApplyMultiplierToBitrate(maxrateMap[highestQuality.Name], multiplier),
 		transcoder.ApplyMultiplierToBitrate(bufsizeMap[highestQuality.Name], multiplier),
 	)
-	
+
 	args = append(args, encoderArgs...)
-	
+
 	// Only add scene detection for CPU encoding
 	if !selectedEncoder.IsGPU {
 		args = append(args,
@@ -354,7 +632,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 			"-sc_threshold", "0",
 		)
 	}
-	
+
 	// Only add audio encoding settings if audio exists
 	if videoHasAudio {
 		args = append(args,
@@ -378,7 +656,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 		vsm += fmt.Sprintf(",a:0")
 	}
 	vsm += fmt.Sprintf(",name:%s", highestQuality.Name)
-	
+
 	args = append(args,
 		"-var_stream_map", vsm,
 		"-hls_segment_filename", filepath.Join(outputDir, "%v/segment_%03d.ts"),
@@ -419,7 +697,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 				if progress > 90 {
 					progress = 90
 				}
-				
+
 				db.UpdateVideoProgress(database, videoID, progress)
 				lastUpdate = time.Now().UTC()
 				fmt.Printf("Highest quality progress: %d%% (frame %d/%d)\n", progress, currentFrame, totalFrames)
@@ -428,23 +706,23 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 	}
 
 	err = cmd.Wait()
-	
+
 	// If GPU encoding failed, retry with CPU
 	if err != nil && selectedEncoder.IsGPU {
 		fmt.Println("GPU encoding failed, retrying with CPU encoder (libx264)...")
-		
+
 		// Rebuild args with CPU encoder
 		args := []string{
-			"-thread_queue_size", "16",  // Reduce thread queue size
+			"-thread_queue_size", "16", // Reduce thread queue size
 			"-i", inputPath,
 			"-filter_complex", filter,
 			"-map", "[vout]",
 		}
-		
+
 		if videoHasAudio {
 			args = append(args, "-map", "0:a:0")
 		}
-		
+
 		args = append(args,
 			"-c:v", "libx264",
 			"-preset", "veryfast",
@@ -456,7 +734,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 			"-keyint_min", "48",
 			"-sc_threshold", "0",
 		)
-		
+
 		if videoHasAudio {
 			args = append(args,
 				"-c:a", "aac",
@@ -464,7 +742,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 				"-b:a", "256k",
 			)
 		}
-		
+
 		args = append(args,
 			"-f", "hls",
 			"-hls_flags", "independent_segments",
@@ -475,7 +753,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 			"-hls_segment_filename", filepath.Join(outputDir, "%v/segment_%03d.ts"),
 			filepath.Join(outputDir, "%v/playlist.m3u8"),
 		)
-		
+
 		cmd = exec.Command("ffmpeg", args...)
 		stdout, _ = cmd.StdoutPipe()
 		cmd.Stderr = os.Stderr
@@ -483,7 +761,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 		if err != nil {
 			return err
 		}
-		
+
 		// Track progress for fallback
 		lastUpdate = time.Now().UTC()
 		currentFrame = 0
@@ -503,17 +781,17 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 					if progress > 90 {
 						progress = 90
 					}
-					
+
 					db.UpdateVideoProgress(database, videoID, progress)
 					lastUpdate = time.Now().UTC()
 					fmt.Printf("CPU fallback progress: %d%% (frame %d/%d)\n", progress, currentFrame, totalFrames)
 				}
 			}
 		}
-		
+
 		err = cmd.Wait()
 	}
-	
+
 	if err != nil {
 		return err
 	}
@@ -531,45 +809,45 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 // extractCaptions extracts subtitle/caption streams from video and converts to WebVTT format
 func extractCaptions(inputPath, videoID, outputDir string) (bool, error) {
 	// First, check if video has subtitle streams
-	ffprobeCmd := exec.Command("ffprobe", 
+	ffprobeCmd := exec.Command("ffprobe",
 		"-v", "error",
 		"-select_streams", "s",
 		"-show_entries", "stream=index,codec_type",
 		"-of", "csv=p=0",
 		inputPath,
 	)
-	
+
 	output, err := ffprobeCmd.Output()
 	if err != nil || len(output) == 0 {
 		fmt.Println("No subtitles found in video:", err)
 		return false, nil
 	}
-	
+
 	fmt.Println("Found subtitles, extracting...")
-	
+
 	// Extract all subtitle streams to WebVTT format
 	// Use output pattern: captions.vtt for the main caption track
 	captionsPath := filepath.Join(outputDir, "captions.vtt")
-	
+
 	ffmpegCmd := exec.Command("ffmpeg",
 		"-y",
 		"-i", inputPath,
-		"-map", "0:s:0",  // Select first subtitle stream
+		"-map", "0:s:0", // Select first subtitle stream
 		captionsPath,
 	)
-	
+
 	if err := ffmpegCmd.Run(); err != nil {
 		fmt.Println("Warning: Failed to extract captions:", err)
 		return false, nil
 	}
-	
+
 	// Verify file was created and has content
 	if fileInfo, err := os.Stat(captionsPath); err != nil || fileInfo.Size() == 0 {
 		fmt.Println("Caption file empty or not created")
 		os.Remove(captionsPath)
 		return false, nil
 	}
-	
+
 	fmt.Println("Successfully extracted captions to:", captionsPath)
 	return true, nil
 }
@@ -577,13 +855,13 @@ func extractCaptions(inputPath, videoID, outputDir string) (bool, error) {
 func generateMasterPlaylist(outputDir string, selected []Resolution, hasCaptions bool) error {
 	// Generate master.m3u8 with all variants
 	masterContent := "#EXTM3U\n#EXT-X-VERSION:3\n"
-	
+
 	// Add caption track if available
 	if hasCaptions {
 		masterContent += `#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",LANGUAGE="en",NAME="English",DEFAULT=YES,INSTREAM-ID="CC1"
 `
 	}
-	
+
 	// Bandwidths for each quality (approximate)
 	bandwidths := map[string]string{
 		"2160p": "10000000",
@@ -605,7 +883,7 @@ func generateMasterPlaylist(outputDir string, selected []Resolution, hasCaptions
 %s/playlist.m3u8
 `, bandwidth, res.W, res.H, ccAttr, res.Name)
 	}
-	
+
 	// Add caption file URI if available
 	if hasCaptions {
 		masterContent += `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,FORCED=NO,LANGUAGE="en",URI="captions.vtt"
@@ -617,7 +895,7 @@ func generateMasterPlaylist(outputDir string, selected []Resolution, hasCaptions
 	if err != nil {
 		return fmt.Errorf("failed to write master.m3u8: %w", err)
 	}
-	
+
 	fmt.Println("Generated master playlist with", len(selected), "variants")
 	if hasCaptions {
 		fmt.Println("Master playlist includes captions track")
@@ -633,11 +911,11 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	}
 
 	remainingQualities := selected[1:]
-	
+
 	// Filter out already-encoded qualities (for resume capability)
 	var qualitiesToEncode []Resolution
 	var alreadyEncoded []string
-	
+
 	for _, q := range remainingQualities {
 		if isQualityEncoded(outputDir, q.Name) {
 			alreadyEncoded = append(alreadyEncoded, q.Name)
@@ -645,11 +923,11 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 			qualitiesToEncode = append(qualitiesToEncode, q)
 		}
 	}
-	
+
 	if len(alreadyEncoded) > 0 {
 		fmt.Printf("Resuming interrupted encode - skipping already-encoded qualities: %v\n", alreadyEncoded)
 	}
-	
+
 	if len(qualitiesToEncode) == 0 {
 		fmt.Println("All quality variants already encoded, skipping remaining qualities stage")
 		return generateMasterPlaylist(outputDir, selected, hasCaptions)
@@ -797,7 +1075,7 @@ func transcodeWithProgress(inputPath, videoID string, database *sql.DB) (int, er
 	}
 	fmt.Printf("Total frames: %d\n", totalFrames)
 
-	outputDir := filepath.Join(getOutputDir(), videoID)
+	outputDir := paths.VideoDir(videoID)
 
 	width, height, err := transcoder.GetVideoResolution(inputPath)
 	if err != nil {
@@ -868,10 +1146,9 @@ func transcodeWithProgress(inputPath, videoID string, database *sql.DB) (int, er
 }
 
 func processDownloadJob(job *queue.DownloadJob) {
-	homeDir := os.Getenv("HOME")
-	videoDir := filepath.Join(homeDir, "giltube/output", job.VideoID, job.Quality)
+	videoDir := paths.VideoQualityDir(job.VideoID, job.Quality)
 	playlistPath := filepath.Join(videoDir, "playlist.m3u8")
-	
+
 	// Check if playlist exists
 	if _, err := os.Stat(playlistPath); os.IsNotExist(err) {
 		fmt.Println("Playlist not found:", playlistPath)
@@ -879,7 +1156,7 @@ func processDownloadJob(job *queue.DownloadJob) {
 	}
 
 	// Prepare output file
-	outputDir := filepath.Join(homeDir, "giltube/downloads")
+	outputDir := paths.DownloadsDir()
 	os.MkdirAll(outputDir, 0755)
 	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s_%s.mp4", job.VideoID, job.Quality))
 
@@ -894,7 +1171,7 @@ func processDownloadJob(job *queue.DownloadJob) {
 	)
 
 	fmt.Println("Converting HLS to MP4:", outputFile)
-	
+
 	err := cmd.Run()
 	if err != nil {
 		fmt.Println("FFmpeg error:", err)
@@ -905,20 +1182,6 @@ func processDownloadJob(job *queue.DownloadJob) {
 	fileInfo, err := os.Stat(outputFile)
 	if err != nil || fileInfo.Size() == 0 {
 		fmt.Println("Failed to create download file:", outputFile)
-		return
-	}
-
-	// Open and sync file to ensure it's written to disk
-	f, err := os.Open(outputFile)
-	if err != nil {
-		fmt.Println("Failed to open download file for sync:", err)
-		return
-	}
-	defer f.Close()
-	
-	// Sync file to disk
-	if err := f.Sync(); err != nil {
-		fmt.Println("Failed to sync download file:", err)
 		return
 	}
 
@@ -945,6 +1208,18 @@ func main() {
 		}
 	}()
 
+	go func() {
+		for {
+			job, err := q.DequeueLiveRecording()
+			if err != nil {
+				fmt.Println("Live recording queue error:", err)
+				continue
+			}
+			fmt.Println("Processing live recording job:", job.Action, job.StreamKey)
+			processLiveRecordingJob(cfg, database, job)
+		}
+	}()
+
 	// Main transcoding job processor
 	for {
 		job, err := q.Dequeue()
@@ -955,7 +1230,7 @@ func main() {
 
 		// Convert Windows UNC paths to WSL Linux paths if worker is running in WSL
 		job.FilePath = convertWindowsPathToWSL(job.FilePath)
-		
+
 		// Translate WSL paths to Windows interop format if running on Windows
 		job.FilePath = translatePath(job.FilePath)
 
@@ -987,9 +1262,9 @@ func main() {
 		// Only generate thumbnail if no custom thumbnail exists
 		if !hasCustomThumbnail {
 			thumbURL = "/videos/" + job.VideoID + "/thumbnail.jpg"
-			
+
 			// 2. generate thumbnail (10% progress)
-			outputPath := filepath.Join(getOutputDir(), job.VideoID)
+			outputPath := paths.VideoDir(job.VideoID)
 			err = transcoder.GenerateThumbnail(job.FilePath, job.VideoID, outputPath)
 			if err != nil {
 				fmt.Println("Thumbnail error:", err)
@@ -1009,7 +1284,7 @@ func main() {
 			thumbURL = existingThumbnailURL
 			fmt.Println("Using custom thumbnail for", job.VideoID)
 		}
-		
+
 		err = db.UpdateVideoProgress(database, job.VideoID, 10)
 		if err != nil {
 			fmt.Println("Progress update error (10%):", err)
@@ -1025,7 +1300,7 @@ func main() {
 			cleanup(job.FilePath)
 			continue
 		}
-		
+
 		// 4. mark as ready after highest quality is done (100% progress)
 		// Lower quality variants continue encoding in background
 		err = db.UpdateVideoStatus(database, job.VideoID, "ready")
@@ -1033,7 +1308,7 @@ func main() {
 			fmt.Println("DB error marking as ready:", err)
 			continue
 		}
-		
+
 		hlsPath := "/videos/" + job.VideoID + "/master.m3u8"
 
 		_, err = database.Exec(
@@ -1054,10 +1329,8 @@ func main() {
 
 		// Don't delete the file yet - it's still being used by background encoding
 		// cleanup(job.FilePath)
-		
+
 		fmt.Println("Video ready to watch (background encoding in progress):", job.VideoID)
 	}
-
-
 
 }

@@ -1,23 +1,42 @@
 package api
 
 import (
-	"io"
 	"bytes"
-	"net/http"
-	"time"
-	"fmt"
-	"strings"
-	"strconv"
-	"path/filepath"
-	"os"
-	"mime/multipart"
 	"database/sql"
+	"fmt"
+	"github.com/gil/giltube/internal/db"
+	"github.com/gil/giltube/internal/models"
+	"github.com/gil/giltube/internal/paths"
+	"github.com/gil/giltube/internal/queue"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/gil/giltube/internal/models"
-	"github.com/gil/giltube/internal/queue"
-	"github.com/gil/giltube/internal/db"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 )
+
+func resolveDownloadQuality(videoID, requestedQuality string) (string, error) {
+	requestedQuality = strings.TrimSpace(requestedQuality)
+	if requestedQuality != "" && requestedQuality != "best" && requestedQuality != "highest" {
+		videoDir := paths.VideoQualityDir(videoID, requestedQuality)
+		playlistPath := filepath.Join(videoDir, "playlist.m3u8")
+		if info, err := os.Stat(playlistPath); err == nil && !info.IsDir() {
+			return requestedQuality, nil
+		}
+	}
+
+	if quality, ok := paths.HighestAvailableQuality(videoID); ok {
+		return quality, nil
+	}
+
+	return "", fmt.Errorf("no available qualities found")
+}
 
 func parseInt(value string, defaultVal int) int {
 	if value == "" {
@@ -29,7 +48,6 @@ func parseInt(value string, defaultVal int) int {
 	}
 	return num
 }
-
 
 func (s *Server) uploadVideo(c *gin.Context) {
 	file, err := c.FormFile("video")
@@ -46,32 +64,30 @@ func (s *Server) uploadVideo(c *gin.Context) {
 	}
 	videoID := uuid.New().String()
 	video := models.Video{
-		ID:        videoID,
-		Title:     c.PostForm("title"),
-		Description:  c.PostForm("description"),
-		Status:    "uploaded",
-		CreatedAt: time.Now().UTC(),
-		ChannelID: c.PostForm("channel_id"),
-
+		ID:          videoID,
+		Title:       c.PostForm("title"),
+		Description: c.PostForm("description"),
+		Status:      "uploaded",
+		CreatedAt:   time.Now().UTC(),
+		ChannelID:   c.PostForm("channel_id"),
 	}
 	var channelID = strings.TrimSpace(c.PostForm("channel_id"))
 	fmt.Println("channel_id:", channelID)
 	_, err = s.db.Exec(
-	"INSERT INTO videos (id, title, description, status, created_at, channel_id, hls_path) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-	video.ID,
-	video.Title,
-	video.Description,
-	video.Status,
-	video.CreatedAt,
-	channelID,
-	video.HLSPath,
+		"INSERT INTO videos (id, title, description, status, created_at, channel_id, hls_path) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+		video.ID,
+		video.Title,
+		video.Description,
+		video.Status,
+		video.CreatedAt,
+		channelID,
+		video.HLSPath,
 	)
 
-	
 	if err != nil {
-	fmt.Println("DB ERROR:", err)
-	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-	return
+		fmt.Println("DB ERROR:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
 	categoryIDsStr := c.PostForm("category_ids")
@@ -83,7 +99,7 @@ func (s *Server) uploadVideo(c *gin.Context) {
 				validCategoryIDs = append(validCategoryIDs, trimmed)
 			}
 		}
-		
+
 		if len(validCategoryIDs) > 0 {
 			if err := db.AssignCategoriesToVideo(s.db, video.ID, validCategoryIDs); err != nil {
 				fmt.Println("Category assignment error:", err)
@@ -92,7 +108,7 @@ func (s *Server) uploadVideo(c *gin.Context) {
 		}
 	}
 
-	err= s.queue.Enqueue(queue.Job{VideoID: video.ID, FilePath: path})
+	err = s.queue.Enqueue(queue.Job{VideoID: video.ID, FilePath: path})
 	if err != nil {
 		fmt.Println("Queue ERROR:", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "queue failed"})
@@ -104,13 +120,13 @@ func (s *Server) uploadVideo(c *gin.Context) {
 
 func (s *Server) listVideos(c *gin.Context) {
 	type ChannelResponse struct {
-		ID          string `json:"id"`
-		UserID      string `json:"user_id"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		ID          string    `json:"id"`
+		UserID      string    `json:"user_id"`
+		Name        string    `json:"name"`
+		Description string    `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
-		AvatarURL   string `json:"avatar_url"`
-		Verified    bool `json:"verified"`
+		AvatarURL   string    `json:"avatar_url"`
+		Verified    bool      `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -252,7 +268,7 @@ func (s *Server) listMyVideos(c *gin.Context) {
 	if userID == "" {
 		userID = c.GetHeader("X-User-ID")
 	}
-	
+
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
@@ -275,13 +291,13 @@ func (s *Server) listMyVideos(c *gin.Context) {
 	}
 
 	type ChannelResponse struct {
-		ID          string `json:"id"`
-		UserID      string `json:"user_id"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		ID          string    `json:"id"`
+		UserID      string    `json:"user_id"`
+		Name        string    `json:"name"`
+		Description string    `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
-		AvatarURL   string `json:"avatar_url"`
-		Verified    bool `json:"verified"`
+		AvatarURL   string    `json:"avatar_url"`
+		Verified    bool      `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -396,8 +412,6 @@ func (s *Server) listMyVideos(c *gin.Context) {
 	c.JSON(http.StatusOK, videos)
 }
 
-
-
 func (s *Server) streamVideo(c *gin.Context) {
 	videoID := c.Param("id")
 	requestPath := c.Param("filepath")
@@ -433,13 +447,13 @@ func (s *Server) getVideo(c *gin.Context) {
 	id := c.Param("id")
 
 	type ChannelResponse struct {
-		ID          string `json:"id"`
-		UserID      string `json:"user_id"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		ID          string    `json:"id"`
+		UserID      string    `json:"user_id"`
+		Name        string    `json:"name"`
+		Description string    `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
-		AvatarURL   string `json:"avatar_url"`
-		Verified    bool `json:"verified"`
+		AvatarURL   string    `json:"avatar_url"`
+		Verified    bool      `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -513,7 +527,7 @@ func (s *Server) getVideo(c *gin.Context) {
 	}
 
 	fmt.Printf("DEBUG getVideo response: id=%s, explicit=%v\n", v.ID, v.Explicit)
-	
+
 	// Fetch categories for this video
 	categories, err := db.GetVideoCategories(s.db, v.ID)
 	if err == nil && categories != nil {
@@ -528,7 +542,7 @@ func (s *Server) getVideo(c *gin.Context) {
 			})
 		}
 	}
-	
+
 	c.JSON(http.StatusOK, VideoResponse{
 		Video: v,
 		Channel: ChannelResponse{
@@ -546,7 +560,7 @@ func (s *Server) getVideo(c *gin.Context) {
 func (s *Server) likeVideo(c *gin.Context) {
 	videoID := c.Param("id")
 	channelID := c.Query("channel_id")
-	
+
 	if channelID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id is required"})
 		return
@@ -599,7 +613,7 @@ func (s *Server) likeVideo(c *gin.Context) {
 func (s *Server) unlikeVideo(c *gin.Context) {
 	videoID := c.Param("id")
 	channelID := c.Query("channel_id")
-	
+
 	if channelID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id is required"})
 		return
@@ -628,7 +642,7 @@ func (s *Server) unlikeVideo(c *gin.Context) {
 func (s *Server) checkIfLiked(c *gin.Context) {
 	videoID := c.Param("id")
 	channelID := c.Query("channel_id")
-	
+
 	if channelID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "channel_id is required"})
 		return
@@ -647,13 +661,13 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 	channelID := c.Param("channel_id")
 
 	type ChannelResponse struct {
-		ID          string `json:"id"`
-		UserID      string `json:"user_id"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		ID          string    `json:"id"`
+		UserID      string    `json:"user_id"`
+		Name        string    `json:"name"`
+		Description string    `json:"description"`
 		CreatedAt   time.Time `json:"created_at"`
-		AvatarURL   string `json:"avatar_url"`
-		Verified    bool `json:"verified"`
+		AvatarURL   string    `json:"avatar_url"`
+		Verified    bool      `json:"verified"`
 	}
 
 	type VideoResponse struct {
@@ -757,7 +771,7 @@ func (s *Server) getChannelVideos(c *gin.Context) {
 
 func (s *Server) downloadVideo(c *gin.Context) {
 	videoID := c.Param("id")
-	quality := c.DefaultQuery("quality", "1080p")
+	requestedQuality := c.Query("quality")
 
 	// Get video from database
 	var video models.Video
@@ -777,19 +791,23 @@ func (s *Server) downloadVideo(c *gin.Context) {
 		return
 	}
 
-	// Build paths
-	homeDir := os.Getenv("HOME")
-	videoDir := filepath.Join(homeDir, "giltube/output", videoID, quality)
+	quality, err := resolveDownloadQuality(videoID, requestedQuality)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "video quality not found"})
+		return
+	}
+
+	videoDir := paths.VideoQualityDir(videoID, quality)
 	playlistPath := filepath.Join(videoDir, "playlist.m3u8")
 
 	// Check if playlist exists
-	if _, err := os.Stat(playlistPath); os.IsNotExist(err) {
+	if info, err := os.Stat(playlistPath); err != nil || info.IsDir() {
 		c.JSON(http.StatusNotFound, gin.H{"error": "video quality not found"})
 		return
 	}
 
 	// Prepare output file path
-	outputDir := filepath.Join(homeDir, "giltube/downloads")
+	outputDir := paths.DownloadsDir()
 	os.MkdirAll(outputDir, 0755)
 	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s_%s.mp4", videoID, quality))
 
@@ -798,6 +816,7 @@ func (s *Server) downloadVideo(c *gin.Context) {
 	if err == nil && fileInfo.ModTime().Add(1*time.Hour).After(time.Now().UTC()) {
 		// File exists and is recent, serve it immediately
 		fmt.Println("Serving cached download:", outputFile)
+		c.Header("X-Download-Quality", quality)
 		c.FileAttachment(outputFile, fmt.Sprintf("%s.mp4", video.Title))
 		return
 	}
@@ -815,18 +834,23 @@ func (s *Server) downloadVideo(c *gin.Context) {
 
 	// Return status response with polling endpoint
 	c.JSON(http.StatusAccepted, gin.H{
-		"status": "processing",
-		"message": "Your download is being prepared. Please check back in a moment.",
-		"check_url": fmt.Sprintf("/api/v1/videos/%s/download-status?quality=%s", videoID, quality),
+		"status":           "processing",
+		"message":          "Your download is being prepared. Please check back in a moment.",
+		"selected_quality": quality,
+		"check_url":        fmt.Sprintf("/api/v1/videos/%s/download-status?quality=%s", videoID, url.QueryEscape(quality)),
 	})
 }
 
 func (s *Server) getDownloadStatus(c *gin.Context) {
 	videoID := c.Param("id")
-	quality := c.DefaultQuery("quality", "1080p")
+	requestedQuality := c.Query("quality")
+	quality, err := resolveDownloadQuality(videoID, requestedQuality)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "not_found", "message": "video quality not found"})
+		return
+	}
 
-	homeDir := os.Getenv("HOME")
-	outputDir := filepath.Join(homeDir, "giltube/downloads")
+	outputDir := paths.DownloadsDir()
 	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s_%s.mp4", videoID, quality))
 
 	// Check if file exists
@@ -834,17 +858,19 @@ func (s *Server) getDownloadStatus(c *gin.Context) {
 	if err == nil && fileInfo.Size() > 0 {
 		// File is ready - return a direct download endpoint instead of static route
 		c.JSON(http.StatusOK, gin.H{
-			"status": "ready",
-			"message": "Your download is ready",
-			"file_url": fmt.Sprintf("/api/v1/downloads/%s/%s", videoID, quality),
+			"status":           "ready",
+			"message":          "Your download is ready",
+			"selected_quality": quality,
+			"file_url":         fmt.Sprintf("/api/v1/downloads/%s/%s", videoID, quality),
 		})
 		return
 	}
 
 	// Still processing
 	c.JSON(http.StatusOK, gin.H{
-		"status": "processing",
-		"message": "Your download is still being prepared.",
+		"status":           "processing",
+		"message":          "Your download is still being prepared.",
+		"selected_quality": quality,
 	})
 }
 
@@ -852,8 +878,7 @@ func (s *Server) serveDownload(c *gin.Context) {
 	videoID := c.Param("videoID")
 	quality := c.Param("quality")
 
-	homeDir := os.Getenv("HOME")
-	outputDir := filepath.Join(homeDir, "giltube/downloads")
+	outputDir := paths.DownloadsDir()
 	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s_%s.mp4", videoID, quality))
 
 	// Security: prevent path traversal
@@ -897,16 +922,14 @@ func (s *Server) deleteVideo(c *gin.Context) {
 
 	// Clean up HLS files
 	if video.HLSPath != "" {
-		homeDir := os.Getenv("HOME")
-		hlsPath := filepath.Join(homeDir, "giltube/output", videoID)
+		hlsPath := paths.VideoDir(videoID)
 		if _, err := os.Stat(hlsPath); err == nil {
 			os.RemoveAll(hlsPath)
 		}
 	}
 
 	// Clean up download files
-	homeDir := os.Getenv("HOME")
-	downloadsDir := filepath.Join(homeDir, "giltube/downloads")
+	downloadsDir := paths.DownloadsDir()
 	if files, err := os.ReadDir(downloadsDir); err == nil {
 		for _, file := range files {
 			if strings.HasPrefix(file.Name(), videoID+"_") {
@@ -920,7 +943,7 @@ func (s *Server) deleteVideo(c *gin.Context) {
 
 func (s *Server) reEncodeVideo(c *gin.Context) {
 	videoID := c.Param("id")
-	
+
 	// Check if video exists
 	var video models.Video
 	err := s.db.QueryRow("SELECT id, status FROM videos WHERE id = $1", videoID).Scan(&video.ID, &video.Status)
@@ -928,10 +951,10 @@ func (s *Server) reEncodeVideo(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "video not found"})
 		return
 	}
-	
+
 	// Get file path from request (user must provide the original video file)
 	filePath := c.PostForm("file_path")
-	
+
 	// If no file path provided, try to get uploaded file
 	if filePath == "" {
 		file, err := c.FormFile("video")
@@ -939,7 +962,7 @@ func (s *Server) reEncodeVideo(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "must provide file_path or upload video file"})
 			return
 		}
-		
+
 		// Save uploaded file to temp
 		tempPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s-%s", videoID, file.Filename))
 		if err := c.SaveUploadedFile(file, tempPath); err != nil {
@@ -954,23 +977,23 @@ func (s *Server) reEncodeVideo(c *gin.Context) {
 			return
 		}
 	}
-	
+
 	// Queue for re-encoding
 	err = s.queue.Enqueue(queue.Job{VideoID: videoID, FilePath: filePath})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue video"})
 		return
 	}
-	
+
 	// Update video status
 	_, err = s.db.Exec("UPDATE videos SET status = $1, progress = 0 WHERE id = $2", "processing", videoID)
 	if err != nil {
 		fmt.Printf("Warning: failed to update video status: %v\n", err)
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{
-		"message": "video queued for re-encoding",
-		"video_id": videoID,
+		"message":   "video queued for re-encoding",
+		"video_id":  videoID,
 		"file_path": filePath,
 	})
 }
@@ -1059,9 +1082,9 @@ func (s *Server) uploadChunk(c *gin.Context) {
 
 	// Return the upload_id so frontend can use it for subsequent requests
 	c.JSON(http.StatusOK, gin.H{
-		"upload_id": uploadID,
+		"upload_id":   uploadID,
 		"chunk_index": chunkIndex,
-		"message": "chunk uploaded successfully",
+		"message":     "chunk uploaded successfully",
 	})
 }
 
@@ -1169,7 +1192,7 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 
 	// Get all chunks from upload directory
 	uploadsDir := filepath.Join("/tmp", "giltube-uploads", uploadID)
-	
+
 	// List all chunks in the directory
 	entries, err := os.ReadDir(uploadsDir)
 	if err != nil {
@@ -1225,7 +1248,7 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 	// Handle thumbnail upload if provided
 	var thumbnailURL string
 	var hasCustomThumbnail bool
-	
+
 	thumbnailFile, err := c.FormFile("thumbnail")
 	if err == nil && thumbnailFile != nil {
 		// Save custom thumbnail using same path as edit-video
@@ -1235,7 +1258,7 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 			// Save with timestamped name
 			thumbnailName := fmt.Sprintf("custom_thumbnail_%d.jpg", time.Now().Unix())
 			thumbnailPath := filepath.Join(thumbnailsDir, thumbnailName)
-			
+
 			if err := c.SaveUploadedFile(thumbnailFile, thumbnailPath); err == nil {
 				// Set thumbnail URL and mark as custom
 				thumbnailURL = fmt.Sprintf("/videos/%s/%s", videoID, thumbnailName)
@@ -1280,9 +1303,9 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 	fmt.Printf("Finalized upload %s as video %s (title: %s)\n", uploadID, videoID, title)
 
 	c.JSON(http.StatusCreated, gin.H{
-		"video_id": video.ID,
-		"title": video.Title,
-		"status": video.Status,
+		"video_id":   video.ID,
+		"title":      video.Title,
+		"status":     video.Status,
 		"created_at": video.CreatedAt,
 	})
 }
@@ -1290,7 +1313,7 @@ func (s *Server) finalizeUpload(c *gin.Context) {
 func (s *Server) updateVideo(c *gin.Context) {
 	videoID := c.Param("id")
 	userID := c.GetHeader("X-User-ID")
-	
+
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
@@ -1323,24 +1346,24 @@ func (s *Server) updateVideo(c *gin.Context) {
 
 	// Get form data - handle both JSON and form-data
 	var req struct {
-		Title                  string `json:"title" form:"title"`
-		Description            string `json:"description" form:"description"`
-		RevertToAutoThumbnail  bool   `json:"revert_to_auto_thumbnail" form:"revert_to_auto_thumbnail"`
-		Explicit               *bool  `json:"explicit" form:"explicit"`
-		CategoryIDs            string `json:"category_ids" form:"category_ids"`
+		Title                 string `json:"title" form:"title"`
+		Description           string `json:"description" form:"description"`
+		RevertToAutoThumbnail bool   `json:"revert_to_auto_thumbnail" form:"revert_to_auto_thumbnail"`
+		Explicit              *bool  `json:"explicit" form:"explicit"`
+		CategoryIDs           string `json:"category_ids" form:"category_ids"`
 	}
-	
+
 	// Try parsing as JSON first, then fall back to form
 	contentType := c.ContentType()
 	fmt.Printf("DEBUG: contentType=%q\n", contentType)
-	
+
 	// Read body for debugging
 	bodyBytes, _ := io.ReadAll(c.Request.Body)
 	fmt.Printf("DEBUG: body=%s\n", string(bodyBytes))
-	
+
 	// Reset body for actual parsing
 	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	
+
 	if strings.Contains(contentType, "application/json") {
 		if err := c.BindJSON(&req); err != nil {
 			fmt.Printf("DEBUG JSON parse error: %v\n", err)
@@ -1353,7 +1376,7 @@ func (s *Server) updateVideo(c *gin.Context) {
 		req.Description = c.PostForm("description")
 		req.RevertToAutoThumbnail = c.PostForm("revert_to_auto_thumbnail") == "true"
 		req.CategoryIDs = c.PostForm("category_ids")
-		
+
 		// Parse explicit as boolean from form
 		explicitStr := c.PostForm("explicit")
 		if explicitStr != "" {
@@ -1367,9 +1390,9 @@ func (s *Server) updateVideo(c *gin.Context) {
 	if !strings.Contains(contentType, "application/json") {
 		thumbnailFile, _ = c.FormFile("thumbnail")
 	}
-	
+
 	fmt.Printf("DEBUG updateVideo: title=%q, hasFile=%v, revert=%v, explicit=%v\n", req.Title, thumbnailFile != nil, req.RevertToAutoThumbnail, req.Explicit)
-	
+
 	// Build update data
 	updateFields := []string{}
 	updateArgs := []interface{}{}
@@ -1407,7 +1430,7 @@ func (s *Server) updateVideo(c *gin.Context) {
 		// Save with unique name
 		thumbnailName := fmt.Sprintf("custom_thumbnail_%d.jpg", time.Now().Unix())
 		thumbnailPath := filepath.Join(thumbnailsDir, thumbnailName)
-		
+
 		if err := c.SaveUploadedFile(thumbnailFile, thumbnailPath); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save thumbnail"})
 			return
@@ -1429,7 +1452,7 @@ func (s *Server) updateVideo(c *gin.Context) {
 		updateFields = append(updateFields, fmt.Sprintf("thumbnail_url = $%d", argCount))
 		updateArgs = append(updateArgs, autoThumbnailURL)
 		argCount++
-		
+
 		updateFields = append(updateFields, fmt.Sprintf("has_custom_thumbnail = $%d", argCount))
 		updateArgs = append(updateArgs, false)
 		argCount++
@@ -1442,13 +1465,13 @@ func (s *Server) updateVideo(c *gin.Context) {
 
 	// Add video ID as last parameter
 	updateArgs = append(updateArgs, videoID)
-	
+
 	// Build and execute update query
-	query := fmt.Sprintf("UPDATE videos SET %s WHERE id = $%d", 
+	query := fmt.Sprintf("UPDATE videos SET %s WHERE id = $%d",
 		strings.Join(updateFields, ", "), argCount)
-	
+
 	fmt.Printf("DEBUG updateVideo: query=%s, args=%v\n", query, updateArgs)
-	
+
 	_, err = s.db.Exec(query, updateArgs...)
 	if err != nil {
 		fmt.Println("Update error:", err)
@@ -1465,7 +1488,7 @@ func (s *Server) updateVideo(c *gin.Context) {
 				validCategoryIDs = append(validCategoryIDs, trimmed)
 			}
 		}
-		
+
 		if len(validCategoryIDs) > 0 {
 			if err := db.AssignCategoriesToVideo(s.db, videoID, validCategoryIDs); err != nil {
 				fmt.Println("Category assignment error:", err)
@@ -1476,4 +1499,3 @@ func (s *Server) updateVideo(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "video updated successfully"})
 }
-

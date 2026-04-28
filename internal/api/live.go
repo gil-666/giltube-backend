@@ -1,10 +1,11 @@
 package api
 
 import (
-	"encoding/json"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gil/giltube/internal/queue"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -26,6 +28,12 @@ type liveManageRequest struct {
 type postLiveChatRequest struct {
 	ChannelID string `json:"channel_id"`
 	Message   string `json:"message"`
+}
+
+type liveStateCacheEntry struct {
+	isLive     bool
+	cachedAt   time.Time
+	fromRemote bool
 }
 
 func (s *Server) ensureLiveStreamsTable() error {
@@ -46,6 +54,9 @@ func (s *Server) ensureLiveStreamsTable() error {
 
 		ALTER TABLE live_streams
 		ADD COLUMN IF NOT EXISTS use_publisher_presence BOOLEAN NOT NULL DEFAULT FALSE;
+
+		ALTER TABLE live_streams
+		ADD COLUMN IF NOT EXISTS vod_video_id TEXT NULL;
 
 		CREATE TABLE IF NOT EXISTS live_chat_messages (
 			id TEXT PRIMARY KEY,
@@ -163,7 +174,7 @@ func (s *Server) mediamtxPathIsLive(streamPath string) (bool, error) {
 		return false, err
 	}
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 400 * time.Millisecond}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, err
@@ -194,17 +205,49 @@ func (s *Server) mediamtxPathIsLive(streamPath string) (bool, error) {
 	return payload.Ready || payload.SourceReady || payload.ReaderCount > 0, nil
 }
 
+func (s *Server) cachedLiveState(streamPath string) (liveStateCacheEntry, bool) {
+	s.liveStateCacheMu.RLock()
+	entry, ok := s.liveStateCache[streamPath]
+	s.liveStateCacheMu.RUnlock()
+	if !ok {
+		return liveStateCacheEntry{}, false
+	}
+	if time.Since(entry.cachedAt) > 2*time.Second {
+		return liveStateCacheEntry{}, false
+	}
+	return entry, true
+}
+
+func (s *Server) storeLiveState(streamPath string, isLive bool, fromRemote bool) {
+	s.liveStateCacheMu.Lock()
+	s.liveStateCache[streamPath] = liveStateCacheEntry{
+		isLive:     isLive,
+		cachedAt:   time.Now(),
+		fromRemote: fromRemote,
+	}
+	s.liveStateCacheMu.Unlock()
+}
+
 func (s *Server) resolveLiveState(manualStatus string, usePublisherPresence bool, streamKey string) (bool, bool) {
 	manualLive := manualStatus == "live"
 	if !usePublisherPresence || strings.TrimSpace(streamKey) == "" {
 		return manualLive, false
 	}
 
-	publisherLive, err := s.mediamtxPathIsLive("live/" + streamKey)
+	streamPath := "live/" + streamKey
+	if entry, ok := s.cachedLiveState(streamPath); ok {
+		return entry.isLive, entry.fromRemote
+	}
+
+	publisherLive, err := s.mediamtxPathIsLive(streamPath)
 	if err != nil {
+		if entry, ok := s.cachedLiveState(streamPath); ok {
+			return entry.isLive, entry.fromRemote
+		}
 		// Fallback to manual status if presence check fails.
 		return manualLive, false
 	}
+	s.storeLiveState(streamPath, publisherLive, true)
 	return publisherLive, publisherLive
 }
 
@@ -269,24 +312,24 @@ func (s *Server) getMyLiveStream(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"id":           id,
-		"channel_id":   channelID,
-		"title":        title,
-		"description":  description,
-		"stream_key":   streamKey,
-		"status":       resolvedStatus,
-		"manual_status": status,
-		"use_publisher_presence": usePublisherPresence,
+		"id":                      id,
+		"channel_id":              channelID,
+		"title":                   title,
+		"description":             description,
+		"stream_key":              streamKey,
+		"status":                  resolvedStatus,
+		"manual_status":           status,
+		"use_publisher_presence":  usePublisherPresence,
 		"publisher_detected_live": publisherDetectedLive,
-		"started_at":   parseNullTime(startedAt),
-		"ended_at":     parseNullTime(endedAt),
-		"created_at":   createdAt,
-		"updated_at":   updatedAt,
-		"ingest_url":   s.liveIngestURL(),
-		"ingest_url_local": s.liveLocalIngestURL(),
-		"ingest_url_lan": s.liveLanIngestURL(),
-		"stream_name":  streamKey,
-		"playback_url": s.livePlaybackURL(streamKey),
+		"started_at":              parseNullTime(startedAt),
+		"ended_at":                parseNullTime(endedAt),
+		"created_at":              createdAt,
+		"updated_at":              updatedAt,
+		"ingest_url":              s.liveIngestURL(),
+		"ingest_url_local":        s.liveLocalIngestURL(),
+		"ingest_url_lan":          s.liveLanIngestURL(),
+		"stream_name":             streamKey,
+		"playback_url":            s.livePlaybackURL(streamKey),
 	})
 }
 
@@ -337,7 +380,7 @@ func (s *Server) setMyPublisherPresence(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "publisher presence setting updated",
+		"message":                "publisher presence setting updated",
 		"use_publisher_presence": *body.Enabled,
 	})
 }
@@ -391,8 +434,8 @@ func (s *Server) updateMyLiveStreamSettings(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "live stream settings saved",
-		"title": title,
+		"message":     "live stream settings saved",
+		"title":       title,
 		"description": description,
 	})
 }
@@ -429,6 +472,13 @@ func (s *Server) rotateMyLiveStreamKey(c *gin.Context) {
 		return
 	}
 
+	var currentStreamKey string
+	err = s.db.QueryRow("SELECT stream_key FROM live_streams WHERE channel_id = $1", body.ChannelID).Scan(&currentStreamKey)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load current stream key"})
+		return
+	}
+
 	newKey, err := generateStreamKey()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate stream key"})
@@ -437,7 +487,7 @@ func (s *Server) rotateMyLiveStreamKey(c *gin.Context) {
 
 	_, err = s.db.Exec(`
 		UPDATE live_streams
-		SET stream_key = $1, status = 'offline', started_at = NULL, ended_at = NOW(), updated_at = NOW()
+		SET stream_key = $1, status = 'offline', started_at = NULL, ended_at = NOW(), vod_video_id = NULL, updated_at = NOW()
 		WHERE channel_id = $2
 	`, newKey, body.ChannelID)
 	if err != nil {
@@ -445,14 +495,22 @@ func (s *Server) rotateMyLiveStreamKey(c *gin.Context) {
 		return
 	}
 
+	if err := s.queue.EnqueueLiveRecording(queue.LiveRecordingJob{
+		Action:    "cancel",
+		ChannelID: body.ChannelID,
+		StreamKey: currentStreamKey,
+	}); err != nil {
+		fmt.Printf("failed to enqueue live recorder cancel for rotated key %s: %v\n", currentStreamKey, err)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"message":      "stream key rotated",
-		"stream_key":   newKey,
-		"ingest_url":   s.liveIngestURL(),
+		"message":          "stream key rotated",
+		"stream_key":       newKey,
+		"ingest_url":       s.liveIngestURL(),
 		"ingest_url_local": s.liveLocalIngestURL(),
-		"ingest_url_lan": s.liveLanIngestURL(),
-		"stream_name":  newKey,
-		"playback_url": s.livePlaybackURL(newKey),
+		"ingest_url_lan":   s.liveLanIngestURL(),
+		"stream_name":      newKey,
+		"playback_url":     s.livePlaybackURL(newKey),
 	})
 }
 
@@ -488,6 +546,13 @@ func (s *Server) startMyLiveStream(c *gin.Context) {
 		return
 	}
 
+	var streamKey string
+	err = s.db.QueryRow("SELECT stream_key FROM live_streams WHERE channel_id = $1", body.ChannelID).Scan(&streamKey)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load stream key"})
+		return
+	}
+
 	title := strings.TrimSpace(body.Title)
 	if title == "" {
 		title = "Live Stream"
@@ -496,12 +561,20 @@ func (s *Server) startMyLiveStream(c *gin.Context) {
 
 	_, err = s.db.Exec(`
 		UPDATE live_streams
-		SET title = $1, description = $2, status = 'live', started_at = NOW(), ended_at = NULL, updated_at = NOW()
+		SET title = $1, description = $2, status = 'live', started_at = NOW(), ended_at = NULL, vod_video_id = NULL, updated_at = NOW()
 		WHERE channel_id = $3
 	`, title, description, body.ChannelID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start stream"})
 		return
+	}
+
+	if err := s.queue.EnqueueLiveRecording(queue.LiveRecordingJob{
+		Action:    "start",
+		ChannelID: body.ChannelID,
+		StreamKey: streamKey,
+	}); err != nil {
+		fmt.Printf("failed to enqueue live recorder start for channel %s: %v\n", body.ChannelID, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "stream marked live"})
@@ -534,6 +607,18 @@ func (s *Server) stopMyLiveStream(c *gin.Context) {
 		return
 	}
 
+	var liveStreamID, title, description, streamKey string
+	var existingVODVideoID sql.NullString
+	err = s.db.QueryRow(`
+		SELECT id, title, description, stream_key, vod_video_id
+		FROM live_streams
+		WHERE channel_id = $1
+	`, body.ChannelID).Scan(&liveStreamID, &title, &description, &streamKey, &existingVODVideoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load stream before stopping"})
+		return
+	}
+
 	_, err = s.db.Exec(`
 		UPDATE live_streams
 		SET status = 'offline', ended_at = NOW(), updated_at = NOW()
@@ -544,13 +629,29 @@ func (s *Server) stopMyLiveStream(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "stream stopped"})
+	if existingVODVideoID.Valid && strings.TrimSpace(existingVODVideoID.String) != "" {
+		c.JSON(http.StatusOK, gin.H{"message": "stream stopped", "vod_created": false, "video_id": existingVODVideoID.String})
+		return
+	}
+
+	if err := s.queue.EnqueueLiveRecording(queue.LiveRecordingJob{
+		Action:       "stop",
+		LiveStreamID: liveStreamID,
+		ChannelID:    body.ChannelID,
+		StreamKey:    streamKey,
+		Title:        title,
+		Description:  description,
+	}); err != nil {
+		fmt.Printf("failed to enqueue live recorder stop for channel %s: %v\n", body.ChannelID, err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "stream stopped", "vod_queued": true})
 }
 
 func (s *Server) getChannelLiveStatus(c *gin.Context) {
 	channelID := c.Param("channel_id")
 
-	var title, description, streamKey, status, channelName string
+	var streamID, title, description, streamKey, status, channelName string
 	var usePublisherPresence bool
 	var startedAt, endedAt sql.NullTime
 	var channelAvatar sql.NullString
@@ -558,6 +659,7 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 
 	err := s.db.QueryRow(`
 		SELECT
+			COALESCE(ls.id, ''),
 			COALESCE(ls.title, 'Live Stream'),
 			COALESCE(ls.description, ''),
 			COALESCE(ls.stream_key, ''),
@@ -572,6 +674,7 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 		LEFT JOIN live_streams ls ON ls.channel_id = c.id
 		WHERE c.id = $1
 	`, channelID).Scan(
+		&streamID,
 		&title,
 		&description,
 		&streamKey,
@@ -604,19 +707,20 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 	}
 
 	payload := gin.H{
-		"channel_id":   channelID,
-		"title":        title,
-		"description":  description,
-		"status":       resolvedStatus,
-		"manual_status": status,
-		"use_publisher_presence": usePublisherPresence,
+		"id":                      streamID,
+		"channel_id":              channelID,
+		"title":                   title,
+		"description":             description,
+		"status":                  resolvedStatus,
+		"manual_status":           status,
+		"use_publisher_presence":  usePublisherPresence,
 		"publisher_detected_live": publisherDetectedLive,
-		"started_at":   parseNullTime(startedAt),
-		"ended_at":     parseNullTime(endedAt),
-		"channel":      gin.H{"id": channelID, "name": channelName, "avatar_url": avatar, "verified": channelVerified},
-		"is_live":      isLive,
-		"playback_url": "",
-		"playback_url_public": "",
+		"started_at":              parseNullTime(startedAt),
+		"ended_at":                parseNullTime(endedAt),
+		"channel":                 gin.H{"id": channelID, "name": channelName, "avatar_url": avatar, "verified": channelVerified},
+		"is_live":                 isLive,
+		"playback_url":            "",
+		"playback_url_public":     "",
 	}
 
 	if streamKey != "" {
@@ -673,15 +777,15 @@ func (s *Server) listActiveLiveStreams(c *gin.Context) {
 		}
 
 		streams = append(streams, gin.H{
-			"channel_id":   channelID,
-			"title":        title,
-			"description":  description,
-			"status":       "live",
-			"is_live":      true,
+			"channel_id":             channelID,
+			"title":                  title,
+			"description":            description,
+			"status":                 "live",
+			"is_live":                true,
 			"use_publisher_presence": usePublisherPresence,
-			"started_at":   parseNullTime(startedAt),
-			"playback_url": s.livePlaybackURL(streamKey),
-			"channel":      gin.H{"id": channelID, "name": channelName, "avatar_url": avatar, "verified": verified},
+			"started_at":             parseNullTime(startedAt),
+			"playback_url":           s.livePlaybackURL(streamKey),
+			"channel":                gin.H{"id": channelID, "name": channelName, "avatar_url": avatar, "verified": verified},
 		})
 	}
 
