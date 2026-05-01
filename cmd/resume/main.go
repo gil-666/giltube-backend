@@ -53,7 +53,7 @@ func parsePlaylist(playlistPath string) (int, bool, error) {
 
 // CheckEncodingStatus examines the output directory and reports which qualities are encoded
 func CheckEncodingStatus(outputDir string) {
-	qualities := []string{"144p", "240p", "360p", "480p", "720p", "1080p", "2160p"}
+	qualities := []string{"144p", "240p", "360p", "480p", "720p", "1080p", "2160p", "8K"}
 	
 	fmt.Printf("Checking encoding status for: %s\n", outputDir)
 	fmt.Println(strings.Repeat("=", 80))

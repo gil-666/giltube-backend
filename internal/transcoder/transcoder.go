@@ -114,20 +114,20 @@ func GetVideoBitDepth(inputPath string) int {
 	}
 
 	pixFmt := strings.TrimSpace(string(out))
-	
+
 	// Check for 10-bit formats
 	if strings.Contains(pixFmt, "10le") || strings.Contains(pixFmt, "10be") ||
 		strings.Contains(pixFmt, "p10") || strings.Contains(pixFmt, "10") {
 		fmt.Printf("Detected 10-bit video: %s\n", pixFmt)
 		return 10
 	}
-	
+
 	// Check for 12-bit formats
 	if strings.Contains(pixFmt, "12le") || strings.Contains(pixFmt, "12be") {
 		fmt.Printf("Detected 12-bit video: %s\n", pixFmt)
 		return 12
 	}
-	
+
 	fmt.Printf("Detected 8-bit video: %s\n", pixFmt)
 	return 8
 }
@@ -149,21 +149,19 @@ func IsHDRVideo(inputPath string) bool {
 	}
 
 	transfer := strings.TrimSpace(string(out))
-	
+
 	// Check for HDR transfer functions
 	isHDR := strings.Contains(transfer, "smpte2084") || // PQ (Dolby Vision)
-		strings.Contains(transfer, "arib-std-b67") ||    // HLG
-		strings.Contains(transfer, "bt2020-10") ||       // BT.2020 10-bit
-		transfer == "16"                                  // smpte2084 numeric code
-	
+		strings.Contains(transfer, "arib-std-b67") || // HLG
+		strings.Contains(transfer, "bt2020-10") || // BT.2020 10-bit
+		transfer == "16" // smpte2084 numeric code
+
 	if isHDR {
 		fmt.Printf("Detected HDR video (transfer: %s)\n", transfer)
 	}
-	
+
 	return isHDR
 }
-
-
 
 func Transcode(inputPath, videoID string) error {
 	outputDir := filepath.Join(os.Getenv("HOME"), "giltube/output", videoID)
@@ -185,6 +183,8 @@ func Transcode(inputPath, videoID string) error {
 	}
 
 	all := []Res{
+		{"4320p", 4320},
+		{"2160p", 2160},
 		{"1080p", 1080},
 		{"720p", 720},
 		{"480p", 480},
@@ -210,6 +210,8 @@ func Transcode(inputPath, videoID string) error {
 	// Bitrate ladder (by name)
 	// -------------------------
 	bitrateMap := map[string]string{
+		"4320p": "25000k",
+		"2160p": "10000k",
 		"1080p": "5000k",
 		"720p":  "2500k",
 		"480p":  "1200k",
@@ -219,6 +221,8 @@ func Transcode(inputPath, videoID string) error {
 	}
 
 	maxrateMap := map[string]string{
+		"4320p": "26750k",
+		"2160p": "10700k",
 		"1080p": "5350k",
 		"720p":  "2675k",
 		"480p":  "1280k",
@@ -228,6 +232,8 @@ func Transcode(inputPath, videoID string) error {
 	}
 
 	bufsizeMap := map[string]string{
+		"4320p": "37500k",
+		"2160p": "15000k",
 		"1080p": "7500k",
 		"720p":  "3750k",
 		"480p":  "1800k",
@@ -318,9 +324,6 @@ func Transcode(inputPath, videoID string) error {
 	return cmd.Run()
 }
 
-
-
-
 func GenerateThumbnail(inputPath, videoID, outputDir string) error {
 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -331,14 +334,14 @@ func GenerateThumbnail(inputPath, videoID, outputDir string) error {
 
 	cmd := exec.Command(
 		"ffmpeg",
-		"-y",                 // Auto-overwrite output files
-		"-ss", "3",           // Seek to 3 seconds
-		"-thread_queue_size", "8",   // Reduce thread queue size to avoid excessive buffering
+		"-y",       // Auto-overwrite output files
+		"-ss", "3", // Seek to 3 seconds
+		"-thread_queue_size", "8", // Reduce thread queue size to avoid excessive buffering
 		"-i", inputPath,
-		"-vframes", "1",      // Extract exactly 1 frame
+		"-vframes", "1", // Extract exactly 1 frame
 		"-pix_fmt", "yuvj420p", // Use full-range YUV for JPEG compatibility
-		"-q:v", "2",          // Quality 2 (high quality)
-		"-update", "1",       // Update output file
+		"-q:v", "2", // Quality 2 (high quality)
+		"-update", "1", // Update output file
 		thumbPath,
 	)
 
@@ -375,4 +378,3 @@ func ProcessVideo(inputPath, videoID string) {
 		fmt.Println("Transcode success for", videoID)
 	}
 }
-

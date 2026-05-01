@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -9,11 +10,18 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/gil/giltube/internal/paths"
 	"github.com/gil/giltube/internal/queue"
+	"github.com/gil/giltube/internal/transcoder"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -30,10 +38,31 @@ type postLiveChatRequest struct {
 	Message   string `json:"message"`
 }
 
-type liveStateCacheEntry struct {
-	isLive     bool
-	cachedAt   time.Time
-	fromRemote bool
+type liveRecordingSession struct {
+	streamKey    string
+	liveStreamID string
+	channelID    string
+	title        string
+	description  string
+	outputPath   string
+	cancel       context.CancelFunc
+	done         chan error
+	cmdMu        sync.Mutex
+	cmd          *exec.Cmd
+	stopMu       sync.Mutex
+	stopping     bool
+}
+
+func (s *liveRecordingSession) markStopping() {
+	s.stopMu.Lock()
+	s.stopping = true
+	s.stopMu.Unlock()
+}
+
+func (s *liveRecordingSession) isStopping() bool {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	return s.stopping
 }
 
 func (s *Server) ensureLiveStreamsTable() error {
@@ -46,6 +75,7 @@ func (s *Server) ensureLiveStreamsTable() error {
 			stream_key TEXT NOT NULL UNIQUE,
 			status TEXT NOT NULL DEFAULT 'offline',
 			use_publisher_presence BOOLEAN NOT NULL DEFAULT FALSE,
+			thumbnail_url TEXT NULL,
 			started_at TIMESTAMPTZ NULL,
 			ended_at TIMESTAMPTZ NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -57,6 +87,9 @@ func (s *Server) ensureLiveStreamsTable() error {
 
 		ALTER TABLE live_streams
 		ADD COLUMN IF NOT EXISTS vod_video_id TEXT NULL;
+
+		ALTER TABLE live_streams
+		ADD COLUMN IF NOT EXISTS thumbnail_url TEXT NULL;
 
 		CREATE TABLE IF NOT EXISTS live_chat_messages (
 			id TEXT PRIMARY KEY,
@@ -162,6 +195,586 @@ func (s *Server) livePlaybackURL(streamKey string) string {
 	return strings.TrimRight(s.cfg.MediaMTXHLSBaseURL, "/") + "/live/" + streamKey + "/index.m3u8"
 }
 
+func liveRecordingsDir() string {
+	if dir := strings.TrimSpace(os.Getenv("GILTUBE_LIVE_RECORDINGS_DIR")); dir != "" {
+		return dir
+	}
+	return filepath.Join(paths.OutputDir(), "live-recordings")
+}
+
+func liveThumbnailDir(streamKey string) string {
+	return filepath.Join(paths.OutputDir(), "live-thumbnails", streamKey)
+}
+
+func liveThumbnailOutputPath(streamKey string) string {
+	return filepath.Join(liveThumbnailDir(streamKey), "thumbnail.jpg")
+}
+
+func publicOutputPath(absPath string) (string, error) {
+	relPath, err := filepath.Rel(paths.OutputDir(), absPath)
+	if err != nil {
+		return "", err
+	}
+	relPath = filepath.ToSlash(relPath)
+	if strings.HasPrefix(relPath, "../") || relPath == ".." {
+		return "", fmt.Errorf("path %q is outside output dir", absPath)
+	}
+	return "/videos/" + relPath, nil
+}
+
+func copyFile(srcPath, dstPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+
+	info, err := src.Stat()
+	if err == nil {
+		_ = os.Chmod(dstPath, info.Mode())
+	}
+
+	return dst.Close()
+}
+
+func findLatestLiveRecording(streamKey string, startedAt sql.NullTime) (string, error) {
+	recordingsDir := liveRecordingsDir()
+	if recordingsDir == "" {
+		return "", fmt.Errorf("GILTUBE_LIVE_RECORDINGS_DIR is not configured")
+	}
+
+	var startedAtUTC time.Time
+	if startedAt.Valid {
+		startedAtUTC = startedAt.Time.UTC().Add(-5 * time.Minute)
+	}
+
+	var bestPath string
+	var bestModTime time.Time
+
+	err := filepath.Walk(recordingsDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() {
+			return nil
+		}
+
+		if !strings.Contains(path, streamKey) {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(path))
+		switch ext {
+		case ".mp4", ".m4v", ".webm", ".mov", ".mkv", ".flv":
+		default:
+			return nil
+		}
+
+		modTime := info.ModTime().UTC()
+		if !startedAtUTC.IsZero() && modTime.Before(startedAtUTC) {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestModTime = modTime
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if bestPath == "" {
+		return "", fmt.Errorf("no recording found for stream key %s", streamKey)
+	}
+
+	return bestPath, nil
+}
+
+func (s *Server) archiveCompletedLiveStreamRecording(recordingPath, liveStreamID, channelID, title, description string) (string, error) {
+	videoID := uuid.New().String()
+	videoDir := paths.VideoDir(videoID)
+	destDir := filepath.Join(videoDir, "source")
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return "", err
+	}
+
+	ext := strings.ToLower(filepath.Ext(recordingPath))
+	if ext == "" {
+		ext = ".mp4"
+	}
+	destPath := filepath.Join(destDir, "original"+ext)
+	if err := copyFile(recordingPath, destPath); err != nil {
+		return "", err
+	}
+	defer func() {
+		if err := os.Remove(recordingPath); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("failed to remove temporary live recording %s: %v\n", recordingPath, err)
+		}
+	}()
+
+	publicPath, err := publicOutputPath(destPath)
+	if err != nil {
+		return "", err
+	}
+
+	if strings.TrimSpace(title) == "" {
+		title = "Live Stream"
+	}
+
+	thumbnailURL := ""
+	if err := transcoder.GenerateThumbnail(destPath, videoID, videoDir); err != nil {
+		fmt.Printf("thumbnail generation failed for live VOD %s: %v\n", videoID, err)
+	} else {
+		thumbnailURL = fmt.Sprintf("/videos/%s/thumbnail.jpg", videoID)
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO videos (
+			id, title, description, status, created_at, channel_id, hls_path, thumbnail_url, has_custom_thumbnail
+		) VALUES ($1, $2, $3, 'ready', NOW(), $4, $5, $6, false)
+	`, videoID, title, description, channelID, publicPath, thumbnailURL)
+	if err != nil {
+		return "", err
+	}
+
+	_, err = s.db.Exec(`
+		UPDATE live_streams
+		SET vod_video_id = $1, updated_at = NOW()
+		WHERE id = $2
+	`, videoID, liveStreamID)
+	if err != nil {
+		return "", err
+	}
+
+	return videoID, nil
+}
+
+func (s *Server) archiveLiveRecordingSession(session *liveRecordingSession, recordingPath string) (string, error) {
+	return s.archiveCompletedLiveStreamRecording(recordingPath, session.liveStreamID, session.channelID, session.title, session.description)
+}
+
+func (s *Server) archiveCompletedLiveStream(liveStreamID, channelID, title, description, streamKey string, startedAt sql.NullTime) (string, error) {
+	recordingPath, err := findLatestLiveRecording(streamKey, startedAt)
+	if err != nil {
+		return "", err
+	}
+	return s.archiveCompletedLiveStreamRecording(recordingPath, liveStreamID, channelID, title, description)
+}
+
+func (s *Server) liveRecordingOutputPath(streamKey string) string {
+	return filepath.Join(liveRecordingsDir(), streamKey+".mp4")
+}
+
+func waitForRecordingReady(recordingPath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		info, err := os.Stat(recordingPath)
+		if err == nil && info.Size() > 0 {
+			probe := exec.Command(
+				"ffprobe",
+				"-v", "error",
+				"-show_entries", "format=duration",
+				"-of", "default=noprint_wrappers=1:nokey=1",
+				recordingPath,
+			)
+			if probe.Run() == nil {
+				return nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			if err == nil {
+				return fmt.Errorf("recording is not ready")
+			}
+			return err
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func waitForMediaProbeReady(inputPath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		probe := exec.Command(
+			"ffprobe",
+			"-v", "error",
+			"-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1",
+			inputPath,
+		)
+		if probe.Run() == nil {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("media source is not ready")
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (s *Server) generateLiveThumbnail(streamKey string) error {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return fmt.Errorf("stream key is required")
+	}
+
+	if err := waitForMediaProbeReady(s.livePlaybackURL(streamKey), 30*time.Second); err != nil {
+		return err
+	}
+
+	outputDir := liveThumbnailDir(streamKey)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return err
+	}
+
+	if err := transcoder.GenerateThumbnail(s.livePlaybackURL(streamKey), streamKey, outputDir); err != nil {
+		return err
+	}
+
+	thumbPath := liveThumbnailOutputPath(streamKey)
+	publicPath, err := publicOutputPath(thumbPath)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(
+		`UPDATE live_streams SET thumbnail_url = $1, updated_at = NOW() WHERE stream_key = $2`,
+		publicPath,
+		streamKey,
+	)
+	return err
+}
+
+func (s *Server) runLiveThumbnailLoop(ctx context.Context, streamKey string) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if err := s.generateLiveThumbnail(streamKey); err != nil {
+			fmt.Printf("live thumbnail generation failed for %s: %v\n", streamKey, err)
+		} else {
+			fmt.Printf("live thumbnail updated for %s\n", streamKey)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Minute):
+		}
+	}
+}
+
+func liveRecordingReadyTimeout() time.Duration {
+	return 20 * time.Second
+}
+
+func liveRecordingStopTimeout() time.Duration {
+	return 20 * time.Second
+}
+
+func (s *Server) enqueueLiveRecordingJob(action, liveStreamID, channelID, streamKey, title, description string) {
+	if s.queue == nil {
+		fmt.Printf("live recording queue unavailable for action %s on channel %s\n", action, channelID)
+		return
+	}
+
+	job := queue.LiveRecordingJob{
+		Action:       strings.TrimSpace(action),
+		LiveStreamID: strings.TrimSpace(liveStreamID),
+		ChannelID:    strings.TrimSpace(channelID),
+		StreamKey:    strings.TrimSpace(streamKey),
+		Title:        strings.TrimSpace(title),
+		Description:  strings.TrimSpace(description),
+	}
+
+	if err := s.queue.EnqueueLiveRecording(job); err != nil {
+		fmt.Printf("failed to enqueue live recording job (%s) for channel %s: %v\n", action, channelID, err)
+	}
+}
+
+func (s *Server) hasLiveRecordingSession(streamKey string) bool {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return false
+	}
+
+	s.liveRecordingsMu.Lock()
+	defer s.liveRecordingsMu.Unlock()
+	_, exists := s.liveRecordings[streamKey]
+	return exists
+}
+
+func (s *Server) monitorPublisherPresence() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if err := s.syncPublisherPresenceOnce(); err != nil {
+			fmt.Printf("publisher presence sync failed: %v\n", err)
+		}
+		<-ticker.C
+	}
+}
+
+func (s *Server) monitorLiveThumbnails() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	if err := s.refreshLiveThumbnailsOnce(); err != nil {
+		fmt.Printf("live thumbnail sweep failed: %v\n", err)
+	}
+
+	for {
+		<-ticker.C
+		if err := s.refreshLiveThumbnailsOnce(); err != nil {
+			fmt.Printf("live thumbnail sweep failed: %v\n", err)
+		}
+	}
+}
+
+func (s *Server) refreshLiveThumbnailsOnce() error {
+	rows, err := s.db.Query(`
+		SELECT id, channel_id, status, COALESCE(use_publisher_presence, false), COALESCE(stream_key, '')
+		FROM live_streams
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var liveStreamID, channelID, status, streamKey string
+		var usePublisherPresence bool
+		if err := rows.Scan(&liveStreamID, &channelID, &status, &usePublisherPresence, &streamKey); err != nil {
+			continue
+		}
+
+		isLive, _ := s.resolveLiveState(status, usePublisherPresence, streamKey)
+		if !isLive || strings.TrimSpace(streamKey) == "" {
+			continue
+		}
+
+		if err := s.generateLiveThumbnail(streamKey); err != nil {
+			fmt.Printf("failed to refresh live thumbnail for channel %s: %v\n", channelID, err)
+		}
+	}
+
+	return rows.Err()
+}
+
+func (s *Server) syncPublisherPresenceOnce() error {
+	rows, err := s.db.Query(`
+		SELECT id, channel_id, title, description, stream_key, status, COALESCE(vod_video_id, '')
+		FROM live_streams
+		WHERE COALESCE(use_publisher_presence, false) = true
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var liveStreamID, channelID, title, description, streamKey, status, vodVideoID string
+		if err := rows.Scan(&liveStreamID, &channelID, &title, &description, &streamKey, &status, &vodVideoID); err != nil {
+			continue
+		}
+
+		actualLive, _ := s.resolveLiveState(status, true, streamKey)
+
+		if actualLive {
+			if status != "live" {
+				_, _ = s.db.Exec(`
+					UPDATE live_streams
+					SET status = 'live', started_at = NOW(), ended_at = NULL, vod_video_id = NULL, updated_at = NOW()
+					WHERE id = $1
+				`, liveStreamID)
+				s.enqueueLiveRecordingJob("start", liveStreamID, channelID, streamKey, title, description)
+				var actorUserID string
+				_ = s.db.QueryRow("SELECT user_id FROM channels WHERE id = $1", channelID).Scan(&actorUserID)
+				if err := s.notifyLiveStarted(channelID, actorUserID, title, description); err != nil {
+					fmt.Printf("live start notification broadcast failed for channel %s: %v\n", channelID, err)
+				}
+			}
+			continue
+		}
+
+		if status == "live" {
+			_, _ = s.db.Exec(`
+				UPDATE live_streams
+				SET status = 'offline', ended_at = NOW(), updated_at = NOW()
+				WHERE id = $1
+			`, liveStreamID)
+			if strings.TrimSpace(vodVideoID) == "" {
+				s.enqueueLiveRecordingJob("stop", liveStreamID, channelID, streamKey, title, description)
+			}
+		}
+	}
+
+	return rows.Err()
+}
+
+func (s *Server) runLiveRecordingLoop(ctx context.Context, session *liveRecordingSession) {
+	defer close(session.done)
+	defer func() {
+		s.liveRecordingsMu.Lock()
+		delete(s.liveRecordings, session.streamKey)
+		s.liveRecordingsMu.Unlock()
+	}()
+
+	inputURL := s.liveLocalIngestURL() + "/" + session.streamKey
+
+	for {
+		if ctx.Err() != nil {
+			session.done <- ctx.Err()
+			return
+		}
+
+		_ = os.Remove(session.outputPath)
+		cmd := exec.Command(
+			"ffmpeg",
+			"-y",
+			"-hide_banner",
+			"-loglevel", "error",
+			"-i", inputURL,
+			"-c", "copy",
+			"-movflags", "+faststart",
+			session.outputPath,
+		)
+
+		session.cmdMu.Lock()
+		session.cmd = cmd
+		session.cmdMu.Unlock()
+
+		err := cmd.Run()
+
+		session.cmdMu.Lock()
+		session.cmd = nil
+		session.cmdMu.Unlock()
+
+		if session.isStopping() {
+			session.done <- nil
+			return
+		}
+
+		if ctx.Err() != nil {
+			session.done <- ctx.Err()
+			return
+		}
+
+		if err == nil {
+			if info, statErr := os.Stat(session.outputPath); statErr == nil && info.Size() > 0 {
+				if readyErr := waitForRecordingReady(session.outputPath, liveRecordingReadyTimeout()); readyErr != nil {
+					session.done <- readyErr
+					return
+				}
+				if _, archiveErr := s.archiveLiveRecordingSession(session, session.outputPath); archiveErr != nil {
+					session.done <- archiveErr
+				} else {
+					session.done <- nil
+				}
+				return
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			session.done <- ctx.Err()
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func (s *Server) startLiveRecording(streamKey, liveStreamID, channelID, title, description string) error {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return fmt.Errorf("stream key is required")
+	}
+
+	if err := os.MkdirAll(liveRecordingsDir(), 0755); err != nil {
+		return err
+	}
+
+	s.liveRecordingsMu.Lock()
+	defer s.liveRecordingsMu.Unlock()
+
+	if _, exists := s.liveRecordings[streamKey]; exists {
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &liveRecordingSession{
+		streamKey:  streamKey,
+		outputPath: s.liveRecordingOutputPath(streamKey),
+		cancel:     cancel,
+		done:       make(chan error, 1),
+	}
+	s.liveRecordings[streamKey] = session
+	session.liveStreamID = strings.TrimSpace(liveStreamID)
+	session.channelID = strings.TrimSpace(channelID)
+	session.title = strings.TrimSpace(title)
+	session.description = strings.TrimSpace(description)
+	go s.runLiveRecordingLoop(ctx, session)
+	go s.runLiveThumbnailLoop(ctx, streamKey)
+
+	return nil
+}
+
+func (s *Server) stopLiveRecording(streamKey string) (string, error) {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return "", fmt.Errorf("stream key is required")
+	}
+
+	s.liveRecordingsMu.Lock()
+	session, exists := s.liveRecordings[streamKey]
+	s.liveRecordingsMu.Unlock()
+
+	if exists {
+		session.markStopping()
+		session.cmdMu.Lock()
+		if session.cmd != nil && session.cmd.Process != nil {
+			_ = session.cmd.Process.Signal(syscall.SIGINT)
+		}
+		session.cmdMu.Unlock()
+
+		select {
+		case <-session.done:
+		case <-time.After(liveRecordingStopTimeout()):
+			session.cancel()
+			return session.outputPath, fmt.Errorf("timed out while stopping live recorder")
+		}
+	}
+
+	recordingPath := s.liveRecordingOutputPath(streamKey)
+	if err := waitForRecordingReady(recordingPath, liveRecordingReadyTimeout()); err != nil {
+		return recordingPath, err
+	}
+
+	info, err := os.Stat(recordingPath)
+	if err != nil {
+		return recordingPath, err
+	}
+	if info.Size() == 0 {
+		return recordingPath, fmt.Errorf("live recording is empty")
+	}
+
+	return recordingPath, nil
+}
+
 func (s *Server) mediamtxPathIsLive(streamPath string) (bool, error) {
 	apiBase := strings.TrimRight(s.cfg.MediaMTXAPIURL, "/")
 	if apiBase == "" {
@@ -174,7 +787,7 @@ func (s *Server) mediamtxPathIsLive(streamPath string) (bool, error) {
 		return false, err
 	}
 
-	client := &http.Client{Timeout: 400 * time.Millisecond}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, err
@@ -205,27 +818,33 @@ func (s *Server) mediamtxPathIsLive(streamPath string) (bool, error) {
 	return payload.Ready || payload.SourceReady || payload.ReaderCount > 0, nil
 }
 
-func (s *Server) cachedLiveState(streamPath string) (liveStateCacheEntry, bool) {
-	s.liveStateCacheMu.RLock()
-	entry, ok := s.liveStateCache[streamPath]
-	s.liveStateCacheMu.RUnlock()
-	if !ok {
-		return liveStateCacheEntry{}, false
+func (s *Server) hlsPlaybackPathIsLive(streamKey string) (bool, error) {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return false, nil
 	}
-	if time.Since(entry.cachedAt) > 2*time.Second {
-		return liveStateCacheEntry{}, false
-	}
-	return entry, true
-}
 
-func (s *Server) storeLiveState(streamPath string, isLive bool, fromRemote bool) {
-	s.liveStateCacheMu.Lock()
-	s.liveStateCache[streamPath] = liveStateCacheEntry{
-		isLive:     isLive,
-		cachedAt:   time.Now(),
-		fromRemote: fromRemote,
+	playbackURL := s.livePlaybackURL(streamKey)
+	req, err := http.NewRequest(http.MethodGet, playbackURL, nil)
+	if err != nil {
+		return false, err
 	}
-	s.liveStateCacheMu.Unlock()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, nil
+	}
+
+	return true, nil
 }
 
 func (s *Server) resolveLiveState(manualStatus string, usePublisherPresence bool, streamKey string) (bool, bool) {
@@ -234,21 +853,26 @@ func (s *Server) resolveLiveState(manualStatus string, usePublisherPresence bool
 		return manualLive, false
 	}
 
-	streamPath := "live/" + streamKey
-	if entry, ok := s.cachedLiveState(streamPath); ok {
-		return entry.isLive, entry.fromRemote
-	}
-
-	publisherLive, err := s.mediamtxPathIsLive(streamPath)
+	publisherLive, err := s.mediamtxPathIsLive("live/" + streamKey)
 	if err != nil {
-		if entry, ok := s.cachedLiveState(streamPath); ok {
-			return entry.isLive, entry.fromRemote
+		publisherLive, err = s.hlsPlaybackPathIsLive(streamKey)
+		if err != nil {
+			// Fallback to manual status if presence checks fail.
+			return manualLive, false
 		}
-		// Fallback to manual status if presence check fails.
-		return manualLive, false
 	}
-	s.storeLiveState(streamPath, publisherLive, true)
+	// In publisher-presence mode, publisher state is authoritative when checks succeed.
 	return publisherLive, publisherLive
+}
+
+func persistedLiveState(status string, usePublisherPresence bool) (bool, bool, string) {
+	isLive := status == "live"
+	publisherDetectedLive := usePublisherPresence && isLive
+	resolvedStatus := "offline"
+	if isLive {
+		resolvedStatus = "live"
+	}
+	return isLive, publisherDetectedLive, resolvedStatus
 }
 
 func (s *Server) getMyLiveStream(c *gin.Context) {
@@ -282,9 +906,10 @@ func (s *Server) getMyLiveStream(c *gin.Context) {
 	var usePublisherPresence bool
 	var startedAt, endedAt sql.NullTime
 	var createdAt, updatedAt time.Time
+	var thumbnailURL sql.NullString
 
 	err = s.db.QueryRow(`
-		SELECT id, channel_id, title, description, stream_key, status, use_publisher_presence, started_at, ended_at, created_at, updated_at
+		SELECT id, channel_id, title, description, stream_key, status, use_publisher_presence, thumbnail_url, started_at, ended_at, created_at, updated_at
 		FROM live_streams
 		WHERE channel_id = $1
 	`, channelID).Scan(
@@ -295,6 +920,7 @@ func (s *Server) getMyLiveStream(c *gin.Context) {
 		&streamKey,
 		&status,
 		&usePublisherPresence,
+		&thumbnailURL,
 		&startedAt,
 		&endedAt,
 		&createdAt,
@@ -305,11 +931,7 @@ func (s *Server) getMyLiveStream(c *gin.Context) {
 		return
 	}
 
-	isLive, publisherDetectedLive := s.resolveLiveState(status, usePublisherPresence, streamKey)
-	resolvedStatus := "offline"
-	if isLive {
-		resolvedStatus = "live"
-	}
+	_, publisherDetectedLive, resolvedStatus := persistedLiveState(status, usePublisherPresence)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":                      id,
@@ -321,6 +943,7 @@ func (s *Server) getMyLiveStream(c *gin.Context) {
 		"manual_status":           status,
 		"use_publisher_presence":  usePublisherPresence,
 		"publisher_detected_live": publisherDetectedLive,
+		"thumbnail_url":          func() string { if thumbnailURL.Valid { return thumbnailURL.String }; return "" }(),
 		"started_at":              parseNullTime(startedAt),
 		"ended_at":                parseNullTime(endedAt),
 		"created_at":              createdAt,
@@ -479,6 +1102,8 @@ func (s *Server) rotateMyLiveStreamKey(c *gin.Context) {
 		return
 	}
 
+	s.enqueueLiveRecordingJob("cancel", "", body.ChannelID, currentStreamKey, "", "")
+
 	newKey, err := generateStreamKey()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate stream key"})
@@ -493,14 +1118,6 @@ func (s *Server) rotateMyLiveStreamKey(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rotate stream key"})
 		return
-	}
-
-	if err := s.queue.EnqueueLiveRecording(queue.LiveRecordingJob{
-		Action:    "cancel",
-		ChannelID: body.ChannelID,
-		StreamKey: currentStreamKey,
-	}); err != nil {
-		fmt.Printf("failed to enqueue live recorder cancel for rotated key %s: %v\n", currentStreamKey, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -546,22 +1163,22 @@ func (s *Server) startMyLiveStream(c *gin.Context) {
 		return
 	}
 
-	var streamKey string
-	err = s.db.QueryRow("SELECT stream_key FROM live_streams WHERE channel_id = $1", body.ChannelID).Scan(&streamKey)
+	var liveStreamID, title, description, streamKey, currentStatus string
+	var usePublisherPresence bool
+	err = s.db.QueryRow("SELECT id, title, description, stream_key, status, COALESCE(use_publisher_presence, false) FROM live_streams WHERE channel_id = $1", body.ChannelID).Scan(&liveStreamID, &title, &description, &streamKey, &currentStatus, &usePublisherPresence)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load stream key"})
 		return
 	}
-
-	title := strings.TrimSpace(body.Title)
+	title = strings.TrimSpace(body.Title)
 	if title == "" {
 		title = "Live Stream"
 	}
-	description := strings.TrimSpace(body.Description)
+	description = strings.TrimSpace(body.Description)
 
 	_, err = s.db.Exec(`
 		UPDATE live_streams
-		SET title = $1, description = $2, status = 'live', started_at = NOW(), ended_at = NULL, vod_video_id = NULL, updated_at = NOW()
+		SET title = $1, description = $2, status = 'live', started_at = NOW(), ended_at = NULL, vod_video_id = NULL, thumbnail_url = NULL, updated_at = NOW()
 		WHERE channel_id = $3
 	`, title, description, body.ChannelID)
 	if err != nil {
@@ -569,12 +1186,11 @@ func (s *Server) startMyLiveStream(c *gin.Context) {
 		return
 	}
 
-	if err := s.queue.EnqueueLiveRecording(queue.LiveRecordingJob{
-		Action:    "start",
-		ChannelID: body.ChannelID,
-		StreamKey: streamKey,
-	}); err != nil {
-		fmt.Printf("failed to enqueue live recorder start for channel %s: %v\n", body.ChannelID, err)
+	s.enqueueLiveRecordingJob("start", liveStreamID, body.ChannelID, streamKey, title, description)
+	if currentStatus != "live" {
+		if err := s.notifyLiveStarted(body.ChannelID, userID, title, description); err != nil {
+			fmt.Printf("live start notification broadcast failed for channel %s: %v\n", body.ChannelID, err)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "stream marked live"})
@@ -607,18 +1223,19 @@ func (s *Server) stopMyLiveStream(c *gin.Context) {
 		return
 	}
 
+	var usePublisherPresence bool
 	var liveStreamID, title, description, streamKey string
+	var startedAt sql.NullTime
 	var existingVODVideoID sql.NullString
 	err = s.db.QueryRow(`
-		SELECT id, title, description, stream_key, vod_video_id
+		SELECT id, title, description, stream_key, started_at, vod_video_id, COALESCE(use_publisher_presence, false)
 		FROM live_streams
 		WHERE channel_id = $1
-	`, body.ChannelID).Scan(&liveStreamID, &title, &description, &streamKey, &existingVODVideoID)
+	`, body.ChannelID).Scan(&liveStreamID, &title, &description, &streamKey, &startedAt, &existingVODVideoID, &usePublisherPresence)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load stream before stopping"})
 		return
 	}
-
 	_, err = s.db.Exec(`
 		UPDATE live_streams
 		SET status = 'offline', ended_at = NOW(), updated_at = NOW()
@@ -634,18 +1251,9 @@ func (s *Server) stopMyLiveStream(c *gin.Context) {
 		return
 	}
 
-	if err := s.queue.EnqueueLiveRecording(queue.LiveRecordingJob{
-		Action:       "stop",
-		LiveStreamID: liveStreamID,
-		ChannelID:    body.ChannelID,
-		StreamKey:    streamKey,
-		Title:        title,
-		Description:  description,
-	}); err != nil {
-		fmt.Printf("failed to enqueue live recorder stop for channel %s: %v\n", body.ChannelID, err)
-	}
+	s.enqueueLiveRecordingJob("stop", liveStreamID, body.ChannelID, streamKey, title, description)
 
-	c.JSON(http.StatusOK, gin.H{"message": "stream stopped", "vod_queued": true})
+	c.JSON(http.StatusOK, gin.H{"message": "stream stopped", "vod_created": false})
 }
 
 func (s *Server) getChannelLiveStatus(c *gin.Context) {
@@ -656,6 +1264,7 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 	var startedAt, endedAt sql.NullTime
 	var channelAvatar sql.NullString
 	var channelVerified bool
+	var thumbnailURL sql.NullString
 
 	err := s.db.QueryRow(`
 		SELECT
@@ -665,6 +1274,7 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 			COALESCE(ls.stream_key, ''),
 			COALESCE(ls.status, 'offline'),
 			COALESCE(ls.use_publisher_presence, false),
+			COALESCE(ls.thumbnail_url, ''),
 			ls.started_at,
 			ls.ended_at,
 			c.name,
@@ -680,6 +1290,7 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 		&streamKey,
 		&status,
 		&usePublisherPresence,
+		&thumbnailURL,
 		&startedAt,
 		&endedAt,
 		&channelName,
@@ -700,11 +1311,7 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 		avatar = normalizeAvatarURL(channelAvatar.String)
 	}
 
-	isLive, publisherDetectedLive := s.resolveLiveState(status, usePublisherPresence, streamKey)
-	resolvedStatus := "offline"
-	if isLive {
-		resolvedStatus = "live"
-	}
+	isLive, publisherDetectedLive, resolvedStatus := persistedLiveState(status, usePublisherPresence)
 
 	payload := gin.H{
 		"id":                      streamID,
@@ -715,6 +1322,7 @@ func (s *Server) getChannelLiveStatus(c *gin.Context) {
 		"manual_status":           status,
 		"use_publisher_presence":  usePublisherPresence,
 		"publisher_detected_live": publisherDetectedLive,
+		"thumbnail_url":          func() string { if thumbnailURL.Valid { return thumbnailURL.String }; return "" }(),
 		"started_at":              parseNullTime(startedAt),
 		"ended_at":                parseNullTime(endedAt),
 		"channel":                 gin.H{"id": channelID, "name": channelName, "avatar_url": avatar, "verified": channelVerified},
@@ -740,6 +1348,7 @@ func (s *Server) listActiveLiveStreams(c *gin.Context) {
 			ls.stream_key,
 			ls.status,
 			COALESCE(ls.use_publisher_presence, false),
+			COALESCE(ls.thumbnail_url, ''),
 			ls.started_at,
 			c.name,
 			COALESCE(c.avatar_url, ''),
@@ -761,12 +1370,13 @@ func (s *Server) listActiveLiveStreams(c *gin.Context) {
 		var usePublisherPresence bool
 		var startedAt sql.NullTime
 		var avatarRaw sql.NullString
+		var thumbnailURL sql.NullString
 		var verified bool
-		if err := rows.Scan(&channelID, &title, &description, &streamKey, &status, &usePublisherPresence, &startedAt, &channelName, &avatarRaw, &verified); err != nil {
+		if err := rows.Scan(&channelID, &title, &description, &streamKey, &status, &usePublisherPresence, &thumbnailURL, &startedAt, &channelName, &avatarRaw, &verified); err != nil {
 			continue
 		}
 
-		isLive, _ := s.resolveLiveState(status, usePublisherPresence, streamKey)
+		isLive, _, _ := persistedLiveState(status, usePublisherPresence)
 		if !isLive {
 			continue
 		}
@@ -783,6 +1393,7 @@ func (s *Server) listActiveLiveStreams(c *gin.Context) {
 			"status":                 "live",
 			"is_live":                true,
 			"use_publisher_presence": usePublisherPresence,
+			"thumbnail_url":          func() string { if thumbnailURL.Valid { return thumbnailURL.String }; return "" }(),
 			"started_at":             parseNullTime(startedAt),
 			"playback_url":           s.livePlaybackURL(streamKey),
 			"channel":                gin.H{"id": channelID, "name": channelName, "avatar_url": avatar, "verified": verified},
@@ -925,7 +1536,7 @@ func (s *Server) postLiveChatMessage(c *gin.Context) {
 		return
 	}
 
-	isLive, _ := s.resolveLiveState(status, usePublisherPresence, streamKey)
+	isLive, _, _ := persistedLiveState(status, usePublisherPresence)
 	if !isLive {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "live chat is available only while stream is live"})
 		return

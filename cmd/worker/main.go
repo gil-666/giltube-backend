@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/gil/giltube/config"
 	"github.com/gil/giltube/internal/db"
@@ -36,9 +37,16 @@ type liveRecordingSession struct {
 	done       chan error
 	cmdMu      sync.Mutex
 	cmd        *exec.Cmd
+	leaseCancel context.CancelFunc
+	workerID    string
 }
 
 var liveRecordingSessions sync.Map
+
+var errLiveRecordingNotOwned = errors.New("live recording is owned by another worker")
+
+const liveRecordingLeaseTTL = 5 * time.Minute
+const liveRecordingLeaseRenewInterval = 1 * time.Minute
 
 func translatePath(inputPath string) string {
 	if runtime.GOOS != "windows" {
@@ -283,6 +291,14 @@ func liveRecordingsDir() string {
 	return filepath.Join(paths.OutputDir(), "live-recordings")
 }
 
+func liveThumbnailDir(streamKey string) string {
+	return filepath.Join(paths.OutputDir(), "live-thumbnails", streamKey)
+}
+
+func liveThumbnailOutputPath(streamKey string) string {
+	return filepath.Join(liveThumbnailDir(streamKey), "thumbnail.jpg")
+}
+
 func publicOutputPath(absPath string) (string, error) {
 	relPath, err := filepath.Rel(paths.OutputDir(), absPath)
 	if err != nil {
@@ -332,8 +348,84 @@ func liveRecordingOutputPath(streamKey string) string {
 	return filepath.Join(liveRecordingsDir(), streamKey+".mp4")
 }
 
-func runLiveRecordingLoop(ctx context.Context, cfg *config.Config, session *liveRecordingSession) {
+func waitForRecordingReady(recordingPath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		info, err := os.Stat(recordingPath)
+		if err == nil && info.Size() > 0 {
+			probe := exec.Command(
+				"ffprobe",
+				"-v", "error",
+				"-show_entries", "format=duration",
+				"-of", "default=noprint_wrappers=1:nokey=1",
+				recordingPath,
+			)
+			if probeErr := probe.Run(); probeErr == nil {
+				return nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			if err == nil {
+				return fmt.Errorf("recording is not ready")
+			}
+			return err
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func findLatestLiveRecording(streamKey string) (string, error) {
+	recordingsDir := liveRecordingsDir()
+	if recordingsDir == "" {
+		return "", fmt.Errorf("live recordings dir is not configured")
+	}
+
+	var bestPath string
+	var bestModTime time.Time
+
+	err := filepath.Walk(recordingsDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() {
+			return nil
+		}
+
+		if !strings.Contains(path, streamKey) {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(path))
+		switch ext {
+		case ".mp4", ".m4v", ".webm", ".mov", ".mkv", ".flv":
+		default:
+			return nil
+		}
+
+		modTime := info.ModTime().UTC()
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestModTime = modTime
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if bestPath == "" {
+		return "", fmt.Errorf("no recording found for stream key %s", streamKey)
+	}
+
+	return bestPath, nil
+}
+
+func runLiveRecordingLoop(ctx context.Context, cfg *config.Config, q *queue.Queue, workerID string, session *liveRecordingSession) {
 	defer close(session.done)
+	defer func() {
+		if _, err := q.ReleaseLiveRecordingLease(session.streamKey, workerID); err != nil {
+			fmt.Printf("failed to release live recording lease for %s: %v\n", session.streamKey, err)
+		}
+	}()
 
 	inputURL := liveLocalIngestURL(cfg) + "/" + session.streamKey
 
@@ -343,7 +435,6 @@ func runLiveRecordingLoop(ctx context.Context, cfg *config.Config, session *live
 			return
 		}
 
-		_ = os.Remove(session.outputPath)
 		cmd := exec.Command(
 			"ffmpeg",
 			"-y",
@@ -386,7 +477,121 @@ func runLiveRecordingLoop(ctx context.Context, cfg *config.Config, session *live
 	}
 }
 
-func startLiveRecording(cfg *config.Config, streamKey string) error {
+func waitForMediaProbeReady(inputPath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		probe := exec.Command(
+			"ffprobe",
+			"-v", "error",
+			"-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1",
+			inputPath,
+		)
+		if probe.Run() == nil {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("media source is not ready")
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func livePlaybackURL(cfg *config.Config, streamKey string) string {
+	return strings.TrimRight(cfg.MediaMTXHLSBaseURL, "/") + "/live/" + streamKey + "/index.m3u8"
+}
+
+func updateLiveStreamThumbnail(database *sql.DB, streamKey, thumbnailURL string) error {
+	_, err := database.Exec(
+		`UPDATE live_streams SET thumbnail_url = $1, updated_at = NOW() WHERE stream_key = $2`,
+		thumbnailURL,
+		streamKey,
+	)
+	return err
+}
+
+func generateLiveThumbnail(cfg *config.Config, database *sql.DB, streamKey string) error {
+	streamKey = strings.TrimSpace(streamKey)
+	if streamKey == "" {
+		return fmt.Errorf("stream key is required")
+	}
+
+	inputURL := livePlaybackURL(cfg, streamKey)
+	if err := waitForMediaProbeReady(inputURL, 30*time.Second); err != nil {
+		return err
+	}
+
+	outputDir := liveThumbnailDir(streamKey)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return err
+	}
+
+	if err := transcoder.GenerateThumbnail(inputURL, streamKey, outputDir); err != nil {
+		return err
+	}
+
+	thumbPath := liveThumbnailOutputPath(streamKey)
+	publicPath, err := publicOutputPath(thumbPath)
+	if err != nil {
+		return err
+	}
+
+	return updateLiveStreamThumbnail(database, streamKey, publicPath)
+}
+
+func runLiveThumbnailLoop(ctx context.Context, cfg *config.Config, database *sql.DB, streamKey string) {
+	// Try immediately, then keep refreshing every 2 minutes while live.
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if err := generateLiveThumbnail(cfg, database, streamKey); err != nil {
+			fmt.Printf("live thumbnail generation failed for %s: %v\n", streamKey, err)
+		} else {
+			fmt.Printf("live thumbnail updated for %s\n", streamKey)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Minute):
+		}
+	}
+}
+
+func startLiveRecordingLeaseRenewal(ctx context.Context, q *queue.Queue, streamKey, workerID string, stop func()) {
+	ticker := time.NewTicker(liveRecordingLeaseRenewInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ok, err := q.RefreshLiveRecordingLease(streamKey, workerID, liveRecordingLeaseTTL)
+			if err != nil {
+				fmt.Printf("live recording lease refresh failed for %s: %v\n", streamKey, err)
+				continue
+			}
+			if !ok {
+				fmt.Printf("live recording lease lost for %s on worker %s\n", streamKey, workerID)
+				if stop != nil {
+					stop()
+				}
+				return
+			}
+		}
+	}
+}
+
+func getLiveRecordingLeaseOwner(q *queue.Queue, streamKey string) (string, error) {
+	return q.LiveRecordingLeaseOwner(streamKey)
+}
+
+func startLiveRecording(cfg *config.Config, database *sql.DB, q *queue.Queue, workerID, streamKey string) error {
 	streamKey = strings.TrimSpace(streamKey)
 	if streamKey == "" {
 		return fmt.Errorf("stream key is required")
@@ -400,22 +605,42 @@ func startLiveRecording(cfg *config.Config, streamKey string) error {
 		return nil
 	}
 
+	owned, err := q.AcquireLiveRecordingLease(streamKey, workerID, liveRecordingLeaseTTL)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errLiveRecordingNotOwned
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &liveRecordingSession{
 		streamKey:  streamKey,
 		outputPath: liveRecordingOutputPath(streamKey),
 		cancel:     cancel,
 		done:       make(chan error, 1),
+		leaseCancel: cancel,
+		workerID:    workerID,
 	}
 	liveRecordingSessions.Store(streamKey, session)
-	go runLiveRecordingLoop(ctx, cfg, session)
+	go runLiveRecordingLoop(ctx, cfg, q, workerID, session)
+	go runLiveThumbnailLoop(ctx, cfg, database, streamKey)
+	go startLiveRecordingLeaseRenewal(ctx, q, streamKey, workerID, cancel)
 	return nil
 }
 
-func stopLiveRecording(streamKey string) (string, error) {
+func stopLiveRecording(q *queue.Queue, workerID, streamKey string) (string, error) {
 	streamKey = strings.TrimSpace(streamKey)
 	if streamKey == "" {
 		return "", fmt.Errorf("stream key is required")
+	}
+
+	owner, err := getLiveRecordingLeaseOwner(q, streamKey)
+	if err != nil {
+		return "", err
+	}
+	if owner != "" && owner != workerID {
+		return "", errLiveRecordingNotOwned
 	}
 
 	value, exists := liveRecordingSessions.LoadAndDelete(streamKey)
@@ -435,6 +660,10 @@ func stopLiveRecording(streamKey string) (string, error) {
 		}
 	}
 
+	if err := waitForRecordingReady(liveRecordingOutputPath(streamKey), 5*time.Second); err != nil {
+		return liveRecordingOutputPath(streamKey), err
+	}
+
 	recordingPath := liveRecordingOutputPath(streamKey)
 	info, err := os.Stat(recordingPath)
 	if err != nil {
@@ -442,6 +671,10 @@ func stopLiveRecording(streamKey string) (string, error) {
 	}
 	if info.Size() == 0 {
 		return recordingPath, fmt.Errorf("live recording is empty")
+	}
+
+	if _, err := q.ReleaseLiveRecordingLease(streamKey, workerID); err != nil {
+		fmt.Printf("failed to release live recording lease for %s: %v\n", streamKey, err)
 	}
 
 	return recordingPath, nil
@@ -512,15 +745,25 @@ func archiveCompletedLiveStreamRecording(database *sql.DB, recordingPath string,
 	return err
 }
 
-func processLiveRecordingJob(cfg *config.Config, database *sql.DB, job *queue.LiveRecordingJob) {
+func processLiveRecordingJob(cfg *config.Config, database *sql.DB, q *queue.Queue, workerID string, job *queue.LiveRecordingJob) {
 	switch strings.TrimSpace(job.Action) {
 	case "start":
-		if err := startLiveRecording(cfg, job.StreamKey); err != nil {
+		if err := startLiveRecording(cfg, database, q, workerID, job.StreamKey); err != nil {
+			if errors.Is(err, errLiveRecordingNotOwned) {
+				fmt.Printf("live recording start skipped for %s on worker %s: owned by another worker\n", job.StreamKey, workerID)
+				return
+			}
 			fmt.Printf("live recording start failed for %s: %v\n", job.StreamKey, err)
 		}
 	case "cancel":
-		recordingPath, err := stopLiveRecording(job.StreamKey)
+		recordingPath, err := stopLiveRecording(q, workerID, job.StreamKey)
 		if err != nil && !os.IsNotExist(err) {
+			if errors.Is(err, errLiveRecordingNotOwned) {
+				fmt.Printf("live recording cancel requeued for %s: owned by another worker\n", job.StreamKey)
+				_ = q.EnqueueLiveRecording(*job)
+				time.Sleep(500 * time.Millisecond)
+				return
+			}
 			fmt.Printf("live recording cancel failed for %s: %v\n", job.StreamKey, err)
 		}
 		if recordingPath != "" {
@@ -529,18 +772,37 @@ func processLiveRecordingJob(cfg *config.Config, database *sql.DB, job *queue.Li
 	case "stop":
 		var existingVODVideoID sql.NullString
 		if err := database.QueryRow(
-			"SELECT vod_video_id FROM live_streams WHERE channel_id = $1",
+			"SELECT vod_video_id FROM live_streams WHERE stream_key = $1 OR channel_id = $2 OR id = $3",
+			job.StreamKey,
 			job.ChannelID,
+			job.LiveStreamID,
 		).Scan(&existingVODVideoID); err == nil {
 			if existingVODVideoID.Valid && strings.TrimSpace(existingVODVideoID.String) != "" {
 				fmt.Printf("live recording stop skipped for channel %s: VOD already exists\n", job.ChannelID)
 				return
 			}
 		}
-		recordingPath, err := stopLiveRecording(job.StreamKey)
+		recordingPath, err := stopLiveRecording(q, workerID, job.StreamKey)
 		if err != nil {
-			fmt.Printf("live recording stop failed for %s: %v\n", job.StreamKey, err)
-			return
+			if errors.Is(err, errLiveRecordingNotOwned) {
+				fmt.Printf("live recording stop requeued for %s: owned by another worker\n", job.StreamKey)
+				_ = q.EnqueueLiveRecording(*job)
+				time.Sleep(500 * time.Millisecond)
+				return
+			}
+			if !os.IsNotExist(err) {
+				fmt.Printf("live recording stop failed for %s: %v\n", job.StreamKey, err)
+				return
+			}
+
+			fallbackPath, fallbackErr := findLatestLiveRecording(job.StreamKey)
+			if fallbackErr != nil {
+				fmt.Printf("live recording stop failed for %s: %v\n", job.StreamKey, err)
+				return
+			}
+
+			fmt.Printf("live recording stop fallback for %s: using %s\n", job.StreamKey, fallbackPath)
+			recordingPath = fallbackPath
 		}
 		if err := archiveCompletedLiveStreamRecording(database, recordingPath, job); err != nil {
 			fmt.Printf("live stream archive failed for channel %s: %v\n", job.ChannelID, err)
@@ -570,6 +832,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 	fmt.Printf("Video has audio: %v\n", videoHasAudio)
 
 	bitrateMap := map[string]string{
+		"4320p": "25000k",
 		"2160p": "10000k",
 		"1080p": "5000k",
 		"720p":  "2500k",
@@ -580,6 +843,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 	}
 
 	maxrateMap := map[string]string{
+		"4320p": "26750k",
 		"2160p": "10700k",
 		"1080p": "5350k",
 		"720p":  "2675k",
@@ -590,6 +854,7 @@ func transcodeHighestQualityOnly(inputPath, videoID string, database *sql.DB, se
 	}
 
 	bufsizeMap := map[string]string{
+		"4320p": "37500k",
 		"2160p": "15000k",
 		"1080p": "7500k",
 		"720p":  "3750k",
@@ -864,6 +1129,7 @@ func generateMasterPlaylist(outputDir string, selected []Resolution, hasCaptions
 
 	// Bandwidths for each quality (approximate)
 	bandwidths := map[string]string{
+		"4320p": "25000000",
 		"2160p": "10000000",
 		"1080p": "5000000",
 		"720p":  "2500000",
@@ -936,6 +1202,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	fmt.Printf("Encoding %d remaining quality variants in parallel with libx264 (bit depth: %d)\n", len(qualitiesToEncode), bitDepth)
 
 	bitrateMap := map[string]string{
+		"4320p": "25000k",
 		"2160p": "10000k",
 		"1080p": "5000k",
 		"720p":  "2500k",
@@ -946,6 +1213,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	}
 
 	maxrateMap := map[string]string{
+		"4320p": "26750k",
 		"2160p": "10700k",
 		"1080p": "5350k",
 		"720p":  "2675k",
@@ -956,6 +1224,7 @@ func transcodeRemainingQualities(inputPath, videoID string, database *sql.DB, se
 	}
 
 	bufsizeMap := map[string]string{
+		"4320p": "37500k",
 		"2160p": "15000k",
 		"1080p": "7500k",
 		"720p":  "3750k",
@@ -1099,6 +1368,7 @@ func transcodeWithProgress(inputPath, videoID string, database *sql.DB) (int, er
 	}
 
 	all := []Resolution{
+		{"4320p", 4320, 7680},
 		{"2160p", 2160, 3840},
 		{"1080p", 1080, 1920},
 		{"720p", 720, 1280},
@@ -1192,8 +1462,9 @@ func main() {
 	cfg := config.Load()
 	q := queue.New(cfg.RedisURL)
 	database := db.Connect(cfg.DatabaseURL)
+	workerID := uuid.NewString()
 
-	fmt.Println("Worker started...")
+	fmt.Printf("Worker started... id=%s\n", workerID)
 
 	// Start download job processor in a separate goroutine
 	go func() {
@@ -1216,7 +1487,7 @@ func main() {
 				continue
 			}
 			fmt.Println("Processing live recording job:", job.Action, job.StreamKey)
-			processLiveRecordingJob(cfg, database, job)
+			processLiveRecordingJob(cfg, database, q, workerID, job)
 		}
 	}()
 

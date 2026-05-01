@@ -51,6 +51,49 @@ type pushPayload struct {
 	Image string `json:"image"`
 }
 
+func (s *Server) notifyLiveStarted(channelID, actorUserID, title, description string) error {
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return nil
+	}
+
+	rows, err := s.db.Query(`
+		SELECT id
+		FROM users
+		WHERE COALESCE(status, 'active') = 'active'
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	metadata := map[string]interface{}{
+		"live_channel_id": channelID,
+		"title":           strings.TrimSpace(title),
+		"description":     strings.TrimSpace(description),
+	}
+
+	for rows.Next() {
+		var recipientUserID string
+		if err := rows.Scan(&recipientUserID); err != nil {
+			continue
+		}
+		if strings.TrimSpace(recipientUserID) == "" || recipientUserID == strings.TrimSpace(actorUserID) {
+			continue
+		}
+
+		_ = s.createNotification(notificationCreateInput{
+			RecipientUserID: recipientUserID,
+			ActorChannelID:  channelID,
+			ActorUserID:     actorUserID,
+			Type:            "live_started",
+			Metadata:        metadata,
+		})
+	}
+
+	return rows.Err()
+}
+
 func (s *Server) listNotifications(c *gin.Context) {
 	userID, ok := s.requireUserID(c)
 	if !ok {
@@ -179,7 +222,7 @@ func (s *Server) listNotifications(c *gin.Context) {
 			}
 		}
 
-		item["url"] = buildNotificationURL(eventType, videoID, commentID)
+		item["url"] = buildNotificationURL(eventType, actorChannelID, videoID, commentID)
 		items = append(items, item)
 	}
 
@@ -190,7 +233,10 @@ func (s *Server) listNotifications(c *gin.Context) {
 	})
 }
 
-func buildNotificationURL(eventType string, videoID sql.NullString, commentID sql.NullString) string {
+func buildNotificationURL(eventType string, actorChannelID string, videoID sql.NullString, commentID sql.NullString) string {
+	if eventType == "live_started" && strings.TrimSpace(actorChannelID) != "" {
+		return fmt.Sprintf("/live/%s", actorChannelID)
+	}
 	if videoID.Valid && commentID.Valid {
 		return fmt.Sprintf("/video/%s?comment=%s", videoID.String, commentID.String)
 	}
@@ -461,7 +507,7 @@ func (s *Server) sendNotificationPush(input notificationCreateInput) error {
 	payload := pushPayload{
 		Title: "Giltube",
 		Body:  summarizePushBody(input.Type, actorName),
-		URL:   buildNotificationURL(input.Type, videoID, commentID),
+		URL:   buildNotificationURL(input.Type, input.ActorChannelID, videoID, commentID),
 		Type:  input.Type,
 		Icon:  avatarPushURL,
 		Image: avatarPushURL,
@@ -597,6 +643,8 @@ func summarizePushBody(notificationType, actorName string) string {
 		return actorName + " liked your video"
 	case "like_comment":
 		return actorName + " liked your comment"
+	case "live_started":
+		return actorName + " started a live stream"
 	default:
 		return actorName + " sent you a notification"
 	}

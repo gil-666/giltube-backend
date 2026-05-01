@@ -3,6 +3,8 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"time"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -31,6 +33,8 @@ type LiveRecordingJob struct {
 	Description  string `json:"description"`
 }
 
+const liveRecordingLeasePrefix = "live_recording_lease:"
+
 func New(redisURL string) *Queue {
 	opt, _ := redis.ParseURL(redisURL)
 	client := redis.NewClient(opt)
@@ -51,6 +55,68 @@ func (q *Queue) EnqueueDownload(job DownloadJob) error {
 func (q *Queue) EnqueueLiveRecording(job LiveRecordingJob) error {
 	data, _ := json.Marshal(job)
 	return q.client.RPush(ctx, "live_recording_jobs", data).Err()
+}
+
+func (q *Queue) liveRecordingLeaseKey(streamKey string) string {
+	return liveRecordingLeasePrefix + streamKey
+}
+
+func (q *Queue) AcquireLiveRecordingLease(streamKey, workerID string, ttl time.Duration) (bool, error) {
+	key := q.liveRecordingLeaseKey(streamKey)
+	acquired, err := q.client.SetNX(ctx, key, workerID, ttl).Result()
+	if err != nil || acquired {
+		return acquired, err
+	}
+
+	currentOwner, err := q.client.Get(ctx, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if currentOwner != workerID {
+		return false, nil
+	}
+
+	return q.client.Expire(ctx, key, ttl).Result()
+}
+
+func (q *Queue) LiveRecordingLeaseOwner(streamKey string) (string, error) {
+	owner, err := q.client.Get(ctx, q.liveRecordingLeaseKey(streamKey)).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return owner, err
+}
+
+func (q *Queue) RefreshLiveRecordingLease(streamKey, workerID string, ttl time.Duration) (bool, error) {
+	const script = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+`
+	result, err := q.client.Eval(ctx, script, []string{q.liveRecordingLeaseKey(streamKey)}, workerID, int64(ttl/time.Millisecond)).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
+}
+
+func (q *Queue) ReleaseLiveRecordingLease(streamKey, workerID string) (bool, error) {
+	const script = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`
+	result, err := q.client.Eval(ctx, script, []string{q.liveRecordingLeaseKey(streamKey)}, workerID).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
 }
 
 func (q *Queue) Dequeue() (*Job, error) {
